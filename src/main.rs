@@ -37,7 +37,12 @@ fn real_main() -> Result<()> {
             .context("watchdog parent PID missing")?
             .parse()
             .context("invalid watchdog parent PID")?;
-        return shell::run_watchdog(pid);
+        let appbar_state = args
+            .get(3)
+            .context("watchdog taskbar state missing")?
+            .parse()
+            .context("invalid watchdog taskbar state")?;
+        return shell::run_watchdog(pid, appbar_state);
     }
     let _single_instance = unsafe {
         use windows::Win32::{

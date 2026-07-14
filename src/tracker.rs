@@ -11,18 +11,22 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HWND, LPARAM},
-        Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow},
+        Graphics::{
+            Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
+            Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow},
+        },
         System::Threading::{
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
         },
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             WindowsAndMessaging::{
-                EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE, EVENT_SYSTEM_FOREGROUND, EnumWindows,
-                GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW, GetWindowTextLengthW,
-                GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-                PostThreadMessageW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                CHILDID_SELF, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
+                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZEEND, EnumWindows, GW_OWNER,
+                GWL_EXSTYLE, GetWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
+                GetWindowThreadProcessId, IsIconic, IsWindowVisible, OBJID_WINDOW,
+                PostThreadMessageW, SW_HIDE, ShowWindow, WINEVENT_OUTOFCONTEXT,
+                WINEVENT_SKIPOWNPROCESS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
             },
         },
     },
@@ -32,6 +36,7 @@ use windows::{
 static OWN_PID: OnceLock<u32> = OnceLock::new();
 static UI_THREAD: AtomicU32 = AtomicU32::new(0);
 static REFRESH_MESSAGE: AtomicU32 = AtomicU32::new(0);
+static REFRESH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub struct HookSet(Vec<HWINEVENTHOOK>);
 
@@ -54,17 +59,16 @@ impl HookSet {
             if !foreground.is_invalid() {
                 hooks.push(foreground);
             }
-            let objects = SetWinEventHook(
+            for event in [
                 EVENT_OBJECT_CREATE,
-                EVENT_OBJECT_NAMECHANGE,
-                None,
-                Some(win_event),
-                0,
-                0,
-                flags,
-            );
-            if !objects.is_invalid() {
-                hooks.push(objects);
+                EVENT_OBJECT_DESTROY,
+                EVENT_OBJECT_SHOW,
+                EVENT_SYSTEM_MOVESIZEEND,
+            ] {
+                let hook = SetWinEventHook(event, event, None, Some(win_event), 0, 0, flags);
+                if !hook.is_invalid() {
+                    hooks.push(hook);
+                }
             }
         }
         Self(hooks)
@@ -83,19 +87,38 @@ impl Drop for HookSet {
 
 unsafe extern "system" fn win_event(
     _hook: HWINEVENTHOOK,
-    _event: u32,
-    _hwnd: HWND,
-    _object: i32,
-    _child: i32,
+    event: u32,
+    hwnd: HWND,
+    object: i32,
+    child: i32,
     _event_thread: u32,
     _event_time: u32,
 ) {
+    if event == EVENT_OBJECT_SHOW
+        && crate::shell::should_suppress_taskbar()
+        && crate::shell::is_taskbar_window(hwnd)
+    {
+        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+        return;
+    }
+    if hwnd.is_invalid() || object != OBJID_WINDOW.0 || child != CHILDID_SELF as i32 {
+        return;
+    }
     let thread = UI_THREAD.load(Ordering::Relaxed);
     let message = REFRESH_MESSAGE.load(Ordering::Relaxed);
-    if thread != 0 && message != 0 {
+    if thread != 0
+        && message != 0
+        && REFRESH_PENDING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    {
         let _ =
             unsafe { PostThreadMessageW(thread, message, Default::default(), Default::default()) };
     }
+}
+
+pub fn mark_refresh_handled() {
+    REFRESH_PENDING.store(false, Ordering::Release);
 }
 
 unsafe extern "system" fn enum_window(hwnd: HWND, data: LPARAM) -> windows::core::BOOL {
@@ -106,6 +129,18 @@ unsafe extern "system" fn enum_window(hwnd: HWND, data: LPARAM) -> windows::core
     }
     let style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     if style & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) != 0 {
+        return windows::core::BOOL(1);
+    }
+    let mut cloaked = 0u32;
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED,
+        &mut cloaked as *mut _ as *mut _,
+        std::mem::size_of_val(&cloaked) as u32,
+    )
+    .is_ok()
+        && cloaked != 0
+    {
         return windows::core::BOOL(1);
     }
     let title_len = GetWindowTextLengthW(hwnd);

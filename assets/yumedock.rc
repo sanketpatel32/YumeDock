@@ -1,0 +1,11 @@
+// Windows resource script for YumeDock.
+// Embeds only the application icon. The DPI-awareness is already requested at
+// runtime via SetProcessDpiAwarenessContext in app::App::run, and YumeDock does
+// not use Win32 Common Controls, so no manifest dependency is needed here.
+
+#include <windows.h>
+
+// IDI_ICON1 is the conventional resource id; the linker also exposes it as the
+// first icon, which Windows uses as the exe's display icon in the taskbar,
+// Alt-Tab, Start Menu, and file properties.
+IDI_ICON1 ICON "yumedock.ico"

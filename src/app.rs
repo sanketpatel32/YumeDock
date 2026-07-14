@@ -3,7 +3,10 @@
 use crate::{
     config::{ConfigV1, PinConfig, PinKind},
     model::{DockItem, MonitorInfo, WindowEntry, enumerate_monitors, group_for_monitor},
-    render::{DockVisual, Renderer},
+    render::{
+        DockBounce, DockHover, DockRenderState, DockVisual, Renderer, TopBarSegment,
+        TopBarSegmentFlags, TopBarStatus,
+    },
     shell::{AppBar, TaskbarState},
     status, tracker,
 };
@@ -13,19 +16,23 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::atomic::{AtomicU32, Ordering},
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
-        Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{
             Dwm::{
                 DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
                 DWM_TNP_VISIBLE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+                DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+                DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmQueryThumbnailSourceSize,
                 DwmRegisterThumbnail, DwmSetWindowAttribute, DwmUnregisterThumbnail,
                 DwmUpdateThumbnailProperties,
             },
             Gdi::{
-                BeginPaint, CreateRoundRectRgn, EndPaint, InvalidateRect, PAINTSTRUCT, SetWindowRgn,
+                BeginPaint, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, EndPaint,
+                InvalidateRect, PAINTSTRUCT, RGN_OR, ScreenToClient, SetWindowRgn,
             },
         },
         System::{
@@ -34,12 +41,16 @@ use windows::{
             Threading::GetCurrentThreadId,
         },
         UI::{
-            Controls::WM_MOUSELEAVE,
-            HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
+            Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
+            Controls::{MARGINS, WM_MOUSELEAVE},
+            HiDpi::{
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
+                SetProcessDpiAwarenessContext,
+            },
             Input::KeyboardAndMouse::{
-                KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, TME_LEAVE,
-                TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey, VK_F12, VK_VOLUME_DOWN,
-                VK_VOLUME_MUTE, VK_VOLUME_UP, keybd_event,
+                KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, ReleaseCapture,
+                SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey, VK_F12,
+                VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP, keybd_event,
             },
             Shell::{
                 DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, SHERB_NOCONFIRMATION,
@@ -48,19 +59,20 @@ use windows::{
             WindowsAndMessaging::{
                 AppendMenuW, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu, CreateWindowExW,
                 DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetClientRect,
-                GetCursorPos, GetForegroundWindow, GetMessageW, IDC_ARROW, KillTimer, LWA_ALPHA,
-                LoadCursorW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
-                PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SW_HIDE, SW_RESTORE,
-                SW_SHOW, SW_SHOWNA, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
-                ShowWindow, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE,
-                WM_DESTROY, WM_DISPLAYCHANGE, WM_DROPFILES, WM_HOTKEY, WM_LBUTTONUP, WM_MBUTTONUP,
-                WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
-                WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-                WS_POPUP,
+                GetCursorPos, GetForegroundWindow, GetMessageW, HTCLIENT, HTTRANSPARENT, IDC_ARROW,
+                KillTimer, LoadCursorW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
+                PostQuitMessage, PostThreadMessageW, RegisterClassExW, RegisterWindowMessageW,
+                SPI_GETHIGHCONTRAST, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNA, SetForegroundWindow,
+                SetTimer, ShowWindow, SystemParametersInfoW, TPM_RETURNCMD, TrackPopupMenu,
+                TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY,
+                WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES, WM_HOTKEY, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP,
+                WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+                WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
-    core::{PCWSTR, w},
+    core::{BOOL, PCWSTR, w},
 };
 
 const CLASS_NAME: PCWSTR = w!("YumeDock.NativeWindow");
@@ -81,6 +93,9 @@ const CMD_SOUND_SETTINGS: usize = 112;
 const CMD_VOLUME_DOWN: usize = 113;
 const CMD_VOLUME_UP: usize = 114;
 const CMD_VOLUME_MUTE: usize = 115;
+const CMD_AUTO_HIDE: usize = 116;
+const CMD_POWER_SETTINGS: usize = 117;
+const CMD_DATE_MENU: usize = 118;
 const CMD_OPEN_ITEM: usize = 200;
 const CMD_NEW_INSTANCE: usize = 201;
 const CMD_TOGGLE_PIN: usize = 202;
@@ -88,6 +103,13 @@ const CMD_MINIMIZE_ITEM: usize = 203;
 const CMD_CLOSE_ITEM: usize = 204;
 const CMD_EMPTY_RECYCLE: usize = 205;
 pub const WM_REFRESH: u32 = WM_APP + 1;
+const WM_REBUILD_MONITORS: u32 = WM_APP + 2;
+const STACK_COLUMNS: usize = 5;
+const STACK_CELL_WIDTH: i32 = 72;
+const STACK_CELL_HEIGHT: i32 = 76;
+const STACK_PADDING: i32 = 16;
+const STACK_HEADER: i32 = 38;
+const STACK_FOOTER: i32 = 38;
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -100,6 +122,7 @@ enum WindowKind {
     Dock,
     Reserve,
     Preview,
+    FolderStack,
 }
 
 struct Preview {
@@ -107,6 +130,47 @@ struct Preview {
     thumbnail: isize,
     source: HWND,
     dock: HWND,
+    title: String,
+    close_hover: bool,
+    pointer_x: f32,
+}
+
+struct FolderStack {
+    hwnd: HWND,
+    dock: HWND,
+    folder: std::path::PathBuf,
+    title: String,
+    entries: Vec<std::path::PathBuf>,
+    hover: Option<usize>,
+    footer_hover: bool,
+    pointer_x: f32,
+}
+
+struct LaunchBounce {
+    item: usize,
+    key: String,
+    wait_for_window: bool,
+    started: Instant,
+    finish_after: Option<Duration>,
+}
+
+struct AutoHideState {
+    progress: f32,
+    target: f32,
+    last_tick: Instant,
+}
+
+struct DockDrag {
+    hwnd: HWND,
+    pin: PinConfig,
+    start_x: i32,
+    active: bool,
+}
+
+struct ReorderAnimation {
+    from: usize,
+    to: usize,
+    started: Instant,
 }
 
 struct MonitorShell {
@@ -117,6 +181,34 @@ struct MonitorShell {
     top_appbar: Option<AppBar>,
     bottom_appbar: Option<AppBar>,
     icon_size: f32,
+    scale: f32,
+}
+
+struct DockInteractionGeometry {
+    scale: f32,
+    width: f32,
+    height: f32,
+    count: usize,
+    separator: Option<usize>,
+    icon_size: f32,
+    magnification: f32,
+    hidden: bool,
+    hovered: bool,
+    bouncing: bool,
+    shell_left: f32,
+    shell_top: f32,
+    shell_right: f32,
+    shell_bottom: f32,
+    active_left: f32,
+    active_top: f32,
+    active_right: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DockRegionSignature {
+    hidden: bool,
+    shell: [i32; 4],
+    active: Option<[i32; 4]>,
 }
 
 pub struct App {
@@ -125,15 +217,26 @@ pub struct App {
     shells: Vec<MonitorShell>,
     kinds: HashMap<isize, WindowKind>,
     hover: HashMap<isize, Option<usize>>,
+    cursor_x: HashMap<isize, f32>,
     windows: Vec<WindowEntry>,
     taskbar: TaskbarState,
     safe_mode: bool,
     shutting_down: bool,
     _hooks: Option<tracker::HookSet>,
     preview: Option<Preview>,
+    preview_candidate: Option<(HWND, HWND)>,
+    folder_stack: Option<FolderStack>,
     menu_item: Option<DockItem>,
     animation: HashMap<isize, f32>,
+    animation_clock: HashMap<isize, Instant>,
+    launch_bounce: HashMap<isize, LaunchBounce>,
+    auto_hide: HashMap<isize, AutoHideState>,
+    drag: Option<DockDrag>,
+    reorder_animation: HashMap<isize, ReorderAnimation>,
     cycle_index: HashMap<String, usize>,
+    monitor_rebuild_pending: bool,
+    dock_regions: HashMap<isize, DockRegionSignature>,
+    high_contrast: bool,
 }
 
 impl App {
@@ -150,28 +253,40 @@ impl App {
             unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             Ordering::Relaxed,
         );
-        let renderer = Renderer::new()?;
+        let high_contrast = high_contrast_enabled();
+        let renderer = Renderer::new(high_contrast)?;
         let mut app = Self {
             config,
             renderer,
             shells: Vec::new(),
             kinds: HashMap::new(),
             hover: HashMap::new(),
+            cursor_x: HashMap::new(),
             windows: tracker::enumerate_windows(),
             taskbar: TaskbarState::capture(),
             safe_mode,
             shutting_down: false,
             _hooks: None,
             preview: None,
+            preview_candidate: None,
+            folder_stack: None,
             menu_item: None,
             animation: HashMap::new(),
+            animation_clock: HashMap::new(),
+            launch_bounce: HashMap::new(),
+            auto_hide: HashMap::new(),
+            drag: None,
+            reorder_animation: HashMap::new(),
             cycle_index: HashMap::new(),
+            monitor_rebuild_pending: false,
+            dock_regions: HashMap::new(),
+            high_contrast,
         };
-        app.create_monitor_shells()?;
-        let _ = crate::config::sync_startup(app.config.behavior.start_with_windows);
         if app.config.behavior.replace_taskbar {
             app.taskbar.hide();
         }
+        app.create_monitor_shells()?;
+        let _ = crate::config::sync_startup(app.config.behavior.start_with_windows);
         unsafe {
             RegisterHotKey(
                 None,
@@ -190,7 +305,14 @@ impl App {
         unsafe {
             while GetMessageW(&mut msg, None, 0, 0).into() {
                 if msg.hwnd.is_invalid() && msg.message == WM_REFRESH {
-                    with_app(|app| app.refresh_windows());
+                    with_app(|app| app.schedule_window_refresh());
+                    continue;
+                }
+                if msg.hwnd.is_invalid() && msg.message == WM_REBUILD_MONITORS {
+                    with_app(|app| {
+                        app.monitor_rebuild_pending = false;
+                        app.rebuild_monitors();
+                    });
                     continue;
                 }
                 let _ = TranslateMessage(&msg);
@@ -208,8 +330,9 @@ impl App {
 
     fn create_monitor_shells(&mut self) -> Result<()> {
         for info in enumerate_monitors() {
-            let top_height = self.config.top_bar.height;
-            let dock_height = self.config.dock.height;
+            let scale = info.scale();
+            let top_height = scale_i32(self.config.top_bar.height, scale);
+            let dock_height = scale_i32(self.config.dock.height, scale);
             let width = info.bounds.right - info.bounds.left;
             let bottom_edge = if self.config.behavior.replace_taskbar {
                 info.bounds.bottom
@@ -221,11 +344,12 @@ impl App {
                     .len()
                     .max(1);
             let max_dock_width = width as f32 * 0.82;
-            let icon_size = self
-                .config
-                .dock
-                .icon_size
-                .min((((max_dock_width - 24.0) / item_count as f32) - 8.0).max(30.0));
+            let desired_icon_px = self.config.dock.icon_size * scale;
+            let icon_size_px = desired_icon_px.min(
+                (((max_dock_width - 24.0 * scale) / item_count as f32) - 8.0 * scale)
+                    .max(30.0 * scale),
+            );
+            let icon_size = icon_size_px / scale;
             let top = create_window(info.bounds.left, info.bounds.top, width, top_height, true)?;
             let reserve = create_window(
                 info.bounds.left,
@@ -234,23 +358,41 @@ impl App {
                 dock_height,
                 true,
             )?;
-            let dock_width = ((item_count as f32 * (icon_size + 8.0) + 24.0).ceil() as i32)
-                .clamp(180, (width as f32 * 0.84) as i32);
-            let dock_visual_height = (icon_size * self.config.dock.magnification + 28.0)
+            let base_content = item_count as f32 * icon_size_px
+                + item_count.saturating_sub(1) as f32 * 7.0 * scale
+                + 13.0 * scale;
+            let magnification_room = icon_size_px * (self.config.dock.magnification - 1.0) * 2.7;
+            let dock_width = ((base_content + magnification_room + 212.0 * scale).ceil() as i32)
+                .clamp(scale_i32(220, scale), (width as f32 * 0.96) as i32);
+            let dock_visual_height = ((icon_size * self.config.dock.magnification + 62.0) * scale)
                 .ceil()
                 .max(dock_height as f32) as i32;
             let dock = create_window(
                 info.bounds.left + (width - dock_width) / 2,
-                bottom_edge - dock_visual_height - 8,
+                bottom_edge - dock_visual_height,
                 dock_width,
                 dock_visual_height,
                 false,
             )?;
+            configure_window_backdrop(top, false, self.high_contrast);
+            configure_window_backdrop(dock, true, self.high_contrast);
             self.kinds.insert(top.0 as isize, WindowKind::Top);
             self.kinds.insert(dock.0 as isize, WindowKind::Dock);
             self.kinds.insert(reserve.0 as isize, WindowKind::Reserve);
             self.hover.insert(dock.0 as isize, None);
+            self.cursor_x.insert(dock.0 as isize, 0.0);
+            self.hover.insert(top.0 as isize, None);
+            self.cursor_x.insert(top.0 as isize, 0.0);
             self.animation.insert(dock.0 as isize, 0.0);
+            self.animation_clock.insert(dock.0 as isize, Instant::now());
+            self.auto_hide.insert(
+                dock.0 as isize,
+                AutoHideState {
+                    progress: 0.0,
+                    target: 0.0,
+                    last_tick: Instant::now(),
+                },
+            );
 
             let (top_appbar, bottom_appbar) = if self.config.behavior.reserve_edges {
                 let top_rect = RECT {
@@ -265,10 +407,12 @@ impl App {
                     right: info.bounds.right,
                     bottom: bottom_edge,
                 };
-                (
-                    Some(AppBar::register(top, true, top_rect)?),
-                    Some(AppBar::register(reserve, false, bottom_rect)?),
-                )
+                let bottom_appbar = if self.config.dock.auto_hide {
+                    None
+                } else {
+                    Some(AppBar::register(reserve, false, bottom_rect)?)
+                };
+                (Some(AppBar::register(top, true, top_rect)?), bottom_appbar)
             } else {
                 (None, None)
             };
@@ -276,14 +420,10 @@ impl App {
                 let _ = ShowWindow(top, SW_SHOWNA);
                 let _ = ShowWindow(dock, SW_SHOWNA);
                 let _ = ShowWindow(reserve, SW_HIDE);
-                SetTimer(Some(top), 1, 1000, None);
-                let backdrop = DWMSBT_TRANSIENTWINDOW;
-                let _ = DwmSetWindowAttribute(
-                    dock,
-                    DWMWA_SYSTEMBACKDROP_TYPE,
-                    &backdrop as *const _ as _,
-                    std::mem::size_of_val(&backdrop) as u32,
-                );
+                SetTimer(Some(top), 1, 5000, None);
+                if self.config.dock.auto_hide {
+                    SetTimer(Some(dock), 8, 1000, None);
+                }
             }
             self.shells.push(MonitorShell {
                 info,
@@ -293,13 +433,16 @@ impl App {
                 top_appbar,
                 bottom_appbar,
                 icon_size,
+                scale,
             });
         }
         Ok(())
     }
 
     fn destroy_monitor_shells(&mut self) {
+        self.close_folder_stack();
         self.close_preview();
+        self.preview_candidate = None;
         for shell in self.shells.drain(..) {
             drop(shell.top_appbar);
             drop(shell.bottom_appbar);
@@ -312,7 +455,14 @@ impl App {
         }
         self.kinds.clear();
         self.hover.clear();
+        self.cursor_x.clear();
         self.animation.clear();
+        self.animation_clock.clear();
+        self.launch_bounce.clear();
+        self.auto_hide.clear();
+        self.drag = None;
+        self.reorder_animation.clear();
+        self.dock_regions.clear();
     }
 
     fn rebuild_monitors(&mut self) {
@@ -333,14 +483,98 @@ impl App {
         }
     }
 
+    fn schedule_monitor_rebuild(&mut self) {
+        if self.monitor_rebuild_pending {
+            return;
+        }
+        self.monitor_rebuild_pending = true;
+        unsafe {
+            if PostThreadMessageW(
+                GetCurrentThreadId(),
+                WM_REBUILD_MONITORS,
+                Default::default(),
+                Default::default(),
+            )
+            .is_err()
+            {
+                self.monitor_rebuild_pending = false;
+            }
+        }
+    }
+
     fn refresh_windows(&mut self) {
         self.windows = tracker::enumerate_windows();
+        self.stop_ready_launch_bounces();
         for shell in &self.shells {
             unsafe {
                 let _ = InvalidateRect(Some(shell.dock), None, false);
                 let _ = InvalidateRect(Some(shell.top), None, false);
             }
         }
+    }
+
+    fn refresh_system_settings(&mut self) {
+        let high_contrast = high_contrast_enabled();
+        if self.high_contrast != high_contrast {
+            self.high_contrast = high_contrast;
+            self.renderer.set_high_contrast(high_contrast);
+            self.rebuild_monitors();
+        } else {
+            self.refresh_windows();
+        }
+    }
+
+    fn stop_ready_launch_bounces(&mut self) {
+        let ready: Vec<isize> = self
+            .shells
+            .iter()
+            .filter_map(|shell| {
+                let key = shell.dock.0 as isize;
+                let state = self.launch_bounce.get(&key)?;
+                if !state.wait_for_window {
+                    return None;
+                }
+                let ready = self.shells.iter().any(|candidate| {
+                    group_for_monitor(
+                        &self.config.pins,
+                        &self.windows,
+                        candidate.info.handle.0 as isize,
+                    )
+                    .iter()
+                    .any(|item| {
+                        dock_label(item).eq_ignore_ascii_case(&state.key)
+                            && matches!(item, DockItem::Application { windows, .. } if !windows.is_empty())
+                    })
+                });
+                ready.then_some(key)
+            })
+            .collect();
+        for key in ready {
+            if let Some(state) = self.launch_bounce.get_mut(&key) {
+                let elapsed_ms = state.started.elapsed().as_millis() as u64;
+                let next_landing = (elapsed_ms / 620 + 1) * 620;
+                state.wait_for_window = false;
+                state.finish_after = Some(Duration::from_millis(next_landing));
+            }
+        }
+    }
+
+    fn schedule_window_refresh(&self) {
+        if let Some(shell) = self.shells.first() {
+            unsafe {
+                SetTimer(Some(shell.top), 5, 250, None);
+            }
+        } else {
+            tracker::mark_refresh_handled();
+        }
+    }
+
+    fn process_window_refresh(&mut self, hwnd: HWND) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), 5);
+        }
+        self.refresh_windows();
+        tracker::mark_refresh_handled();
     }
 
     fn restore_shell(&mut self) {
@@ -374,6 +608,205 @@ impl App {
         group_for_monitor(&self.config.pins, &self.windows, monitor)
     }
 
+    fn dock_hit_region(&self, hwnd: HWND, screen_x: i32, screen_y: i32) -> Option<bool> {
+        if self.kinds.get(&(hwnd.0 as isize)) != Some(&WindowKind::Dock) {
+            return None;
+        }
+        let mut point = POINT {
+            x: screen_x,
+            y: screen_y,
+        };
+        if !unsafe { ScreenToClient(hwnd, &mut point) }.as_bool() {
+            return Some(false);
+        }
+        let geometry = self.dock_interaction_geometry(hwnd)?;
+        let point_x = point.x as f32 / geometry.scale;
+        let point_y = point.y as f32 / geometry.scale;
+        if geometry.hidden {
+            return Some(point_y >= geometry.height - 3.0 && point_y <= geometry.height);
+        }
+        if rounded_rect_contains(
+            point_x,
+            point_y,
+            geometry.shell_left,
+            geometry.shell_top,
+            geometry.shell_right,
+            geometry.shell_bottom,
+            18.0,
+        ) {
+            return Some(true);
+        }
+        let over_icon = crate::render::dock_hit_test(
+            point_x,
+            geometry.width,
+            geometry.count,
+            geometry.icon_size,
+            geometry.magnification,
+            geometry.separator,
+        )
+        .is_some();
+        let icon_top = geometry.shell_bottom
+            - 9.0
+            - geometry.icon_size * geometry.magnification
+            - if geometry.bouncing {
+                geometry.icon_size * 0.42
+            } else {
+                0.0
+            };
+        Some(over_icon && point_y >= icon_top && point_y <= geometry.shell_bottom)
+    }
+
+    fn dock_interaction_geometry(&self, hwnd: HWND) -> Option<DockInteractionGeometry> {
+        let mut rect = RECT::default();
+        unsafe { GetClientRect(hwnd, &mut rect).ok()? };
+        let scale = self
+            .monitor_for(hwnd)
+            .map(|shell| shell.scale)
+            .unwrap_or_else(|| window_scale(hwnd));
+        let width = (rect.right - rect.left) as f32 / scale;
+        let height = (rect.bottom - rect.top) as f32 / scale;
+        let icon_size = self
+            .monitor_for(hwnd)
+            .map(|shell| shell.icon_size)
+            .unwrap_or(self.config.dock.icon_size);
+        let items = self.dock_items(hwnd);
+        let separator = items.iter().enumerate().find_map(|(index, item)| {
+            (index > 0
+                && matches!(item, DockItem::Folder(_) | DockItem::RecycleBin)
+                && matches!(items[index - 1], DockItem::Application { .. }))
+            .then_some(index)
+        });
+        let base_content = items.len() as f32 * icon_size
+            + items.len().saturating_sub(1) as f32 * 7.0
+            + separator.map_or(0.0, |_| 13.0);
+        let hide_progress = self
+            .auto_hide
+            .get(&(hwnd.0 as isize))
+            .map_or(0.0, |state| state.progress);
+        let hide_offset = hide_progress * (icon_size + 24.0);
+        let shell_bottom = height - 8.0 + hide_offset;
+        let shell_top = shell_bottom - icon_size - 18.0;
+        let hovered = self
+            .hover
+            .get(&(hwnd.0 as isize))
+            .copied()
+            .flatten()
+            .is_some();
+        let animation = self
+            .animation
+            .get(&(hwnd.0 as isize))
+            .copied()
+            .unwrap_or(if hovered { 1.0 } else { 0.0 });
+        let magnification = if self.config.behavior.reduce_motion {
+            1.0
+        } else {
+            1.0 + (self.config.dock.magnification - 1.0) * animation
+        };
+        let expansion = icon_size * (magnification - 1.0) * 2.7;
+        let shell_width = base_content + expansion + 32.0;
+        let active_half_width =
+            (base_content + expansion + if hovered { 200.0 } else { 48.0 }) / 2.0;
+        let bouncing = self.launch_bounce.contains_key(&(hwnd.0 as isize));
+        let label_top = (shell_top - 36.0).max(0.0);
+        let bounce_top = shell_bottom - 9.0 - icon_size * magnification - icon_size * 0.42;
+        Some(DockInteractionGeometry {
+            scale,
+            width,
+            height,
+            count: items.len(),
+            separator,
+            icon_size,
+            magnification,
+            hidden: hide_progress >= 0.98,
+            hovered,
+            bouncing,
+            shell_left: (width - shell_width) / 2.0,
+            shell_top,
+            shell_right: (width + shell_width) / 2.0,
+            shell_bottom,
+            active_left: width / 2.0 - active_half_width,
+            active_top: if hovered {
+                label_top.min(bounce_top)
+            } else if bouncing {
+                bounce_top
+            } else {
+                shell_top
+            },
+            active_right: width / 2.0 + active_half_width,
+        })
+    }
+
+    fn update_dock_window_region(&mut self, hwnd: HWND) {
+        let Some(geometry) = self.dock_interaction_geometry(hwnd) else {
+            return;
+        };
+        let shell = if geometry.hidden {
+            [
+                0,
+                ((geometry.height - 3.0) * geometry.scale).floor() as i32,
+                (geometry.width * geometry.scale).ceil() as i32,
+                (geometry.height * geometry.scale).ceil() as i32,
+            ]
+        } else {
+            [
+                (geometry.shell_left * geometry.scale).floor() as i32,
+                (geometry.shell_top.max(0.0) * geometry.scale).floor() as i32,
+                (geometry.shell_right * geometry.scale).ceil() as i32,
+                (geometry.shell_bottom.min(geometry.height) * geometry.scale).ceil() as i32,
+            ]
+        };
+        let active = (!geometry.hidden && (geometry.hovered || geometry.bouncing)).then(|| {
+            [
+                (geometry.active_left.max(0.0) * geometry.scale).floor() as i32,
+                (geometry.active_top.max(0.0) * geometry.scale).floor() as i32,
+                (geometry.active_right.min(geometry.width) * geometry.scale).ceil() as i32,
+                (geometry.shell_bottom.min(geometry.height) * geometry.scale).ceil() as i32,
+            ]
+        });
+        let signature = DockRegionSignature {
+            hidden: geometry.hidden,
+            shell,
+            active,
+        };
+        if self.dock_regions.get(&(hwnd.0 as isize)) == Some(&signature) {
+            return;
+        }
+        unsafe {
+            let region = if geometry.hidden {
+                CreateRectRgn(shell[0], shell[1], shell[2], shell[3])
+            } else {
+                CreateRoundRectRgn(
+                    shell[0],
+                    shell[1],
+                    shell[2],
+                    shell[3],
+                    scale_i32(36, geometry.scale),
+                    scale_i32(36, geometry.scale),
+                )
+            };
+            if region.is_invalid() {
+                return;
+            }
+            if let Some(active_bounds) = active {
+                let active_region = CreateRectRgn(
+                    active_bounds[0],
+                    active_bounds[1],
+                    active_bounds[2],
+                    active_bounds[3],
+                );
+                if !active_region.is_invalid() {
+                    let _ = CombineRgn(Some(region), Some(region), Some(active_region), RGN_OR);
+                    let _ = DeleteObject(active_region.into());
+                }
+            }
+            if SetWindowRgn(hwnd, Some(region), false) == 0 {
+                let _ = DeleteObject(region.into());
+            } else {
+                self.dock_regions.insert(hwnd.0 as isize, signature);
+            }
+        }
+    }
+
     fn paint(&mut self, hwnd: HWND) {
         let mut ps = PAINTSTRUCT::default();
         unsafe {
@@ -383,34 +816,59 @@ impl App {
             Some(WindowKind::Top) => {
                 let active = active_app_name(&self.windows);
                 let status = status::read_status();
-                let battery = status
-                    .battery_percent
-                    .map(|p| format!("{}{}%", if status.charging { "⚡" } else { "" }, p))
-                    .unwrap_or_default();
-                let network = if status.network_online { "⌁" } else { "×" };
-                let volume = if status.muted {
-                    "🔇".into()
-                } else {
-                    status
-                        .volume_percent
-                        .map(|v| format!("◕ {v}%"))
-                        .unwrap_or_else(|| "◕".into())
-                };
                 let clock = current_clock(self.config.top_bar.use_24_hour_clock);
+                let date = current_date();
+                let hover = self
+                    .hover
+                    .get(&(hwnd.0 as isize))
+                    .copied()
+                    .flatten()
+                    .and_then(TopBarSegment::decode);
                 self.renderer.paint_top_bar(
                     hwnd,
                     &active,
-                    &format!("{network}   {volume}   {battery}   {clock}"),
+                    &clock,
+                    &date,
+                    TopBarStatus {
+                        battery_percent: status.battery_percent,
+                        charging: status.charging,
+                        network_online: status.network_online,
+                        volume_percent: status.volume_percent,
+                        muted: status.muted,
+                    },
+                    TopBarSegmentFlags {
+                        show_network: self.config.top_bar.show_network,
+                        show_volume: self.config.top_bar.show_volume,
+                        show_battery: self.config.top_bar.show_battery,
+                    },
+                    hover,
                 )
             }
             Some(WindowKind::Dock) => {
+                self.update_dock_window_region(hwnd);
                 let items = self.dock_items(hwnd);
-                let visuals: Vec<_> = items.iter().map(|item| DockVisual {
-                    label: dock_label(item),
-                    running: matches!(item, DockItem::Application { windows, .. } if !windows.is_empty()),
-                    icon_path: dock_icon_path(item),
-                }).collect();
+                let visuals: Vec<_> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let utility = matches!(item, DockItem::Folder(_) | DockItem::RecycleBin);
+                        let previous_is_app = index > 0
+                            && matches!(items[index - 1], DockItem::Application { .. });
+                        let (icon_path, fallback_icon_path) = dock_icon_paths(item);
+                        DockVisual {
+                            label: dock_label(item),
+                            running: matches!(item, DockItem::Application { windows, .. } if !windows.is_empty()),
+                            icon_path,
+                            fallback_icon_path,
+                            separator_before: utility && previous_is_app,
+                            recycle_bin: matches!(item, DockItem::RecycleBin),
+                            folder: matches!(item, DockItem::Folder(_)),
+                        }
+                    })
+                    .collect();
                 let hover = self.hover.get(&(hwnd.0 as isize)).copied().flatten();
+                let hover_x = self.cursor_x.get(&(hwnd.0 as isize)).copied();
+                let dock_hover = hover.zip(hover_x).map(|(index, x)| DockHover { index, x });
                 let icon_size = self
                     .monitor_for(hwnd)
                     .map(|shell| shell.icon_size)
@@ -425,10 +883,107 @@ impl App {
                 } else {
                     1.0 + (self.config.dock.magnification - 1.0) * progress
                 };
-                self.renderer
-                    .paint_dock(hwnd, &visuals, hover, icon_size, magnification)
+                let bounce = self.launch_bounce.get(&(hwnd.0 as isize)).map(|state| {
+                    let frame = launch_bounce_frame(state.started.elapsed(), icon_size);
+                    DockBounce {
+                        item: state.item,
+                        offset: frame.offset,
+                        scale_x: frame.scale_x,
+                        scale_y: frame.scale_y,
+                    }
+                });
+                let hide_progress = self
+                    .auto_hide
+                    .get(&(hwnd.0 as isize))
+                    .map_or(0.0, |state| state.progress);
+                let drag_index = self
+                    .drag
+                    .as_ref()
+                    .filter(|drag| drag.hwnd == hwnd)
+                    .and_then(|drag| {
+                        items
+                            .iter()
+                            .position(|item| dock_pin(item).is_some_and(|pin| pin == &drag.pin))
+                    });
+                let dragging = self
+                    .drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.hwnd == hwnd && drag.active)
+                    .then_some(drag_index)
+                    .flatten();
+                let pressed = self
+                    .drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.hwnd == hwnd && !drag.active)
+                    .then_some(drag_index)
+                    .flatten();
+                let reorder = self
+                    .reorder_animation
+                    .get(&(hwnd.0 as isize))
+                    .map(|animation| {
+                        let progress =
+                            (animation.started.elapsed().as_secs_f32() / 0.18).clamp(0.0, 1.0);
+                        (animation.from, animation.to, ease_out_quart(progress))
+                    });
+                self.renderer.paint_dock(
+                    hwnd,
+                    &visuals,
+                    icon_size,
+                    DockRenderState {
+                        hover: dock_hover,
+                        magnification,
+                        bounce,
+                        hide_progress,
+                        dragging,
+                        pressed,
+                        reorder,
+                    },
+                )
             }
-            Some(WindowKind::Preview) => self.renderer.paint_dock(hwnd, &[], None, 0.0, 1.0),
+            Some(WindowKind::Preview) => {
+                if let Some(preview) = self.preview.as_ref().filter(|preview| preview.hwnd == hwnd)
+                {
+                    self.renderer.paint_preview(
+                        hwnd,
+                        &preview.title,
+                        preview.close_hover,
+                        preview.pointer_x,
+                    )
+                } else {
+                    Ok(())
+                }
+            }
+            Some(WindowKind::FolderStack) => {
+                if let Some(stack) = self
+                    .folder_stack
+                    .as_ref()
+                    .filter(|stack| stack.hwnd == hwnd)
+                {
+                    let entries: Vec<_> = stack
+                        .entries
+                        .iter()
+                        .map(|path| {
+                            (
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                path.clone(),
+                            )
+                        })
+                        .collect();
+                    self.renderer.paint_folder_stack(
+                        hwnd,
+                        &stack.title,
+                        &entries,
+                        stack.hover,
+                        stack.footer_hover,
+                        stack.pointer_x,
+                    )
+                } else {
+                    Ok(())
+                }
+            }
             _ => Ok(()),
         };
         unsafe {
@@ -439,11 +994,67 @@ impl App {
         }
     }
 
-    fn mouse_move(&mut self, hwnd: HWND, x: i32) {
+    fn mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
+        let scale = window_scale(hwnd);
+        let x = (x as f32 / scale).round() as i32;
+        let y = (y as f32 / scale).round() as i32;
+        if self.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::FolderStack) {
+            self.folder_stack_mouse_move(hwnd, x, y);
+            return;
+        }
         if self.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::Preview) {
-            if let Some(preview) = self.preview.as_ref() {
+            if let Some(preview) = self.preview.as_mut() {
                 unsafe {
                     let _ = KillTimer(Some(preview.dock), 3);
+                }
+                let close_hover = (8..=30).contains(&x) && (8..=30).contains(&y);
+                if preview.close_hover != close_hover {
+                    preview.close_hover = close_hover;
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+            }
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                ..Default::default()
+            };
+            unsafe {
+                let _ = TrackMouseEvent(&mut track);
+            }
+            return;
+        }
+        if self.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::Top) {
+            // Menu-bar segment hover: hit-test against the laid-out segments.
+            let status = status::read_status();
+            let active = active_app_name(&self.windows);
+            let (width, height) = client_size_dips(hwnd, scale);
+            let geo = crate::render::top_bar_geometry(
+                width,
+                height,
+                &active,
+                TopBarStatus {
+                    battery_percent: status.battery_percent,
+                    charging: status.charging,
+                    network_online: status.network_online,
+                    volume_percent: status.volume_percent,
+                    muted: status.muted,
+                },
+                TopBarSegmentFlags {
+                    show_network: self.config.top_bar.show_network,
+                    show_volume: self.config.top_bar.show_volume,
+                    show_battery: self.config.top_bar.show_battery,
+                },
+            );
+            let hit = crate::render::top_bar_hit_test(&geo, x as f32).map(TopBarSegment::encode);
+            let previous = self.hover.get(&(hwnd.0 as isize)).copied().flatten();
+            self.cursor_x.insert(hwnd.0 as isize, x as f32);
+            if previous != hit {
+                self.hover.insert(hwnd.0 as isize, hit);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             let mut track = TRACKMOUSEEVENT {
@@ -460,6 +1071,12 @@ impl App {
         if self.kinds.get(&(hwnd.0 as isize)) != Some(&WindowKind::Dock) {
             return;
         }
+        if let Some(stack) = self.folder_stack.as_ref() {
+            unsafe {
+                let _ = KillTimer(Some(stack.hwnd), 10);
+            }
+        }
+        self.reveal_dock(hwnd);
         let items = self.dock_items(hwnd);
         let mut rect = RECT::default();
         unsafe {
@@ -469,16 +1086,42 @@ impl App {
             .monitor_for(hwnd)
             .map(|shell| shell.icon_size)
             .unwrap_or(self.config.dock.icon_size);
-        let step = icon_size + 8.0;
-        let total = items.len() as f32 * step + 24.0;
-        let start = (((rect.right - rect.left) as f32 - total) / 2.0).max(8.0) + 12.0;
-        let index = ((x as f32 - start) / step).floor() as isize;
-        let next = (index >= 0 && index < items.len() as isize).then_some(index as usize);
         let previous = self.hover.get(&(hwnd.0 as isize)).copied().flatten();
+        self.cursor_x.insert(hwnd.0 as isize, x as f32);
+        let progress = self
+            .animation
+            .get(&(hwnd.0 as isize))
+            .copied()
+            .unwrap_or(1.0);
+        let magnification = if self.config.behavior.reduce_motion {
+            1.0
+        } else {
+            1.0 + (self.config.dock.magnification - 1.0) * progress
+        };
+        let separator = items.iter().enumerate().find_map(|(index, item)| {
+            (index > 0
+                && matches!(item, DockItem::Folder(_) | DockItem::RecycleBin)
+                && matches!(items[index - 1], DockItem::Application { .. }))
+            .then_some(index)
+        });
+        let next = crate::render::dock_hit_test(
+            x as f32,
+            (rect.right - rect.left) as f32 / scale,
+            items.len(),
+            icon_size,
+            magnification,
+            separator,
+        );
+        self.update_drag(hwnd, x, next, &items);
         let changed = previous != next;
         self.hover.insert(hwnd.0 as isize, next);
         if changed {
-            self.show_preview(hwnd, next.and_then(|i| items.get(i)).and_then(first_window));
+            if self.drag.as_ref().is_some_and(|drag| drag.active) {
+                self.cancel_preview_candidate(hwnd);
+                self.close_preview();
+            } else {
+                self.schedule_preview(hwnd, next.and_then(|i| items.get(i)).and_then(first_window));
+            }
             if previous.is_none() {
                 self.animation.insert(
                     hwnd.0 as isize,
@@ -488,11 +1131,12 @@ impl App {
                         0.0
                     },
                 );
+                self.animation_clock.insert(hwnd.0 as isize, Instant::now());
             }
-            unsafe {
-                SetTimer(Some(hwnd), 2, 16, None);
-                let _ = InvalidateRect(Some(hwnd), None, false);
-            }
+            unsafe { SetTimer(Some(hwnd), 2, 16, None) };
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
         let mut track = TRACKMOUSEEVENT {
             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -506,10 +1150,18 @@ impl App {
     }
 
     fn mouse_leave(&mut self, hwnd: HWND) {
+        if self.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::FolderStack) {
+            unsafe {
+                SetTimer(Some(hwnd), 10, 250, None);
+            }
+            return;
+        }
         if self.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::Preview) {
             self.close_preview();
             return;
         }
+        self.cancel_preview_candidate(hwnd);
+        self.cursor_x.remove(&(hwnd.0 as isize));
         self.hover.insert(hwnd.0 as isize, None);
         if self.preview.is_some() {
             unsafe {
@@ -522,8 +1174,14 @@ impl App {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
         } else {
+            self.animation_clock.insert(hwnd.0 as isize, Instant::now());
             unsafe {
                 SetTimer(Some(hwnd), 2, 16, None);
+            }
+        }
+        if self.config.dock.auto_hide {
+            unsafe {
+                SetTimer(Some(hwnd), 8, self.config.dock.auto_hide_delay_ms, None);
             }
         }
     }
@@ -541,11 +1199,182 @@ impl App {
             0.0
         };
         let value = self.animation.entry(hwnd.0 as isize).or_default();
-        *value += (target - *value) * 0.24;
+        let now = Instant::now();
+        let last = self.animation_clock.entry(hwnd.0 as isize).or_insert(now);
+        let elapsed = now.saturating_duration_since(*last);
+        *last = now;
+        *value = approach_value(
+            *value,
+            target,
+            elapsed,
+            Duration::from_millis(self.config.dock.animation_ms.max(60) as u64),
+        );
         if (*value - target).abs() < 0.015 {
             *value = target;
             unsafe {
                 let _ = KillTimer(Some(hwnd), 2);
+            }
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    fn reveal_dock(&mut self, hwnd: HWND) {
+        if !self.config.dock.auto_hide {
+            return;
+        }
+        unsafe {
+            let _ = KillTimer(Some(hwnd), 8);
+        }
+        let state = self
+            .auto_hide
+            .entry(hwnd.0 as isize)
+            .or_insert(AutoHideState {
+                progress: 0.0,
+                target: 0.0,
+                last_tick: Instant::now(),
+            });
+        state.target = 0.0;
+        state.last_tick = Instant::now();
+        if self.config.behavior.reduce_motion {
+            state.progress = 0.0;
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        } else {
+            unsafe {
+                SetTimer(Some(hwnd), 7, 16, None);
+            }
+        }
+    }
+
+    fn begin_auto_hide(&mut self, hwnd: HWND) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), 8);
+        }
+        if !self.config.dock.auto_hide
+            || self
+                .hover
+                .get(&(hwnd.0 as isize))
+                .copied()
+                .flatten()
+                .is_some()
+            || self.preview.is_some()
+            || self.launch_bounce.contains_key(&(hwnd.0 as isize))
+            || self.drag.is_some()
+            || self.reorder_animation.contains_key(&(hwnd.0 as isize))
+            || self.folder_stack.is_some()
+        {
+            return;
+        }
+        let state = self
+            .auto_hide
+            .entry(hwnd.0 as isize)
+            .or_insert(AutoHideState {
+                progress: 0.0,
+                target: 1.0,
+                last_tick: Instant::now(),
+            });
+        state.target = 1.0;
+        state.last_tick = Instant::now();
+        if self.config.behavior.reduce_motion {
+            state.progress = 1.0;
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        } else {
+            unsafe {
+                SetTimer(Some(hwnd), 7, 16, None);
+            }
+        }
+    }
+
+    fn animate_auto_hide(&mut self, hwnd: HWND) {
+        let configured_duration = self.config.dock.animation_ms.max(80) as f32;
+        let Some(state) = self.auto_hide.get_mut(&(hwnd.0 as isize)) else {
+            return;
+        };
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(state.last_tick);
+        state.last_tick = now;
+        let duration = Duration::from_millis(
+            (configured_duration
+                * if state.target < state.progress {
+                    0.85
+                } else {
+                    1.15
+                })
+            .round() as u64,
+        );
+        state.progress = approach_value(state.progress, state.target, elapsed, duration);
+        if (state.progress - state.target).abs() < 0.01 {
+            state.progress = state.target;
+            unsafe {
+                let _ = KillTimer(Some(hwnd), 7);
+            }
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    fn animate_reorder(&mut self, hwnd: HWND) {
+        let finished = self
+            .reorder_animation
+            .get(&(hwnd.0 as isize))
+            .is_none_or(|animation| animation.started.elapsed() >= Duration::from_millis(180));
+        if finished {
+            self.reorder_animation.remove(&(hwnd.0 as isize));
+            unsafe {
+                let _ = KillTimer(Some(hwnd), 9);
+                if self.config.dock.auto_hide {
+                    SetTimer(Some(hwnd), 8, self.config.dock.auto_hide_delay_ms, None);
+                }
+            }
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    fn start_launch_bounce(&mut self, hwnd: HWND, item: usize, key: String, wait_for_window: bool) {
+        if self.config.behavior.reduce_motion {
+            return;
+        }
+        self.launch_bounce.insert(
+            hwnd.0 as isize,
+            LaunchBounce {
+                item,
+                key,
+                wait_for_window,
+                started: Instant::now(),
+                finish_after: (!wait_for_window).then_some(Duration::from_millis(620)),
+            },
+        );
+        unsafe {
+            SetTimer(Some(hwnd), 4, 16, None);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    fn animate_launch_bounce(&mut self, hwnd: HWND) {
+        let finished = self
+            .launch_bounce
+            .get(&(hwnd.0 as isize))
+            .is_none_or(|state| {
+                state.started.elapsed() >= Duration::from_secs(8)
+                    || state
+                        .finish_after
+                        .is_some_and(|finish| state.started.elapsed() >= finish)
+            });
+        if finished {
+            self.launch_bounce.remove(&(hwnd.0 as isize));
+            unsafe {
+                let _ = KillTimer(Some(hwnd), 4);
+                if self.config.dock.auto_hide {
+                    SetTimer(Some(hwnd), 8, self.config.dock.auto_hide_delay_ms, None);
+                }
             }
         }
         unsafe {
@@ -563,26 +1392,71 @@ impl App {
                 return;
             }
         }
-        let width = 320;
-        let height = 190;
-        let x = (dock_rect.left + dock_rect.right - width) / 2;
-        let y = dock_rect.top - height - 10;
+        let title = self
+            .windows
+            .iter()
+            .find(|entry| entry.hwnd == source)
+            .map(|entry| entry.title.clone())
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| "Window Preview".to_string());
+        let mut source_rect = RECT::default();
+        unsafe {
+            let _ =
+                windows::Win32::UI::WindowsAndMessaging::GetWindowRect(source, &mut source_rect);
+        }
+        let source_width = (source_rect.right - source_rect.left).max(1) as f32;
+        let source_height = (source_rect.bottom - source_rect.top).max(1) as f32;
+        let scale = self
+            .monitor_for(dock)
+            .map(|shell| shell.scale)
+            .unwrap_or_else(|| window_scale(dock));
+        let content_height = scale_i32(180, scale);
+        let content_width = ((content_height as f32 * source_width / source_height).round() as i32)
+            .clamp(scale_i32(220, scale), scale_i32(360, scale));
+        let width = content_width + scale_i32(16, scale);
+        let height = scale_i32(232, scale);
+        let anchor_x = dock_rect.left
+            + (self
+                .cursor_x
+                .get(&(dock.0 as isize))
+                .copied()
+                .unwrap_or((dock_rect.right - dock_rect.left) as f32 / (2.0 * scale))
+                * scale)
+                .round() as i32;
+        let monitor_bounds = self
+            .monitor_for(dock)
+            .map(|shell| shell.info.bounds)
+            .unwrap_or(dock_rect);
+        let margin = scale_i32(8, scale);
+        let min_x = monitor_bounds.left + margin;
+        let max_x = (monitor_bounds.right - width - margin).max(min_x);
+        let x = (anchor_x - width / 2).clamp(min_x, max_x);
+        let icon_size = self
+            .monitor_for(dock)
+            .map(|shell| shell.icon_size)
+            .unwrap_or(self.config.dock.icon_size);
+        let preview_bottom =
+            dock_rect.bottom - (icon_size * scale).ceil() as i32 - scale_i32(36, scale);
+        let min_y =
+            monitor_bounds.top + scale_i32(self.config.top_bar.height, scale) + scale_i32(8, scale);
+        let y = (preview_bottom - height).max(min_y);
+        let pointer_x = (anchor_x - x) as f32 / scale;
         let Ok(hwnd) = create_window(x, y, width, height, false) else {
             return;
         };
+        configure_window_backdrop(hwnd, true, self.high_contrast);
         unsafe {
             let Ok(thumbnail) = DwmRegisterThumbnail(hwnd, source) else {
                 let _ = DestroyWindow(hwnd);
                 return;
             };
+            let source_size = DwmQueryThumbnailSourceSize(thumbnail).unwrap_or(SIZE {
+                cx: source_width.round() as i32,
+                cy: source_height.round() as i32,
+            });
             let properties = DWM_THUMBNAIL_PROPERTIES {
                 dwFlags: DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY,
-                rcDestination: RECT {
-                    left: 8,
-                    top: 8,
-                    right: width - 8,
-                    bottom: height - 8,
-                },
+                rcDestination: preview_content_rect(source_size, width, height, scale),
                 opacity: 255,
                 fVisible: true.into(),
                 ..Default::default()
@@ -599,8 +1473,40 @@ impl App {
                 thumbnail,
                 source,
                 dock,
+                title,
+                close_hover: false,
+                pointer_x,
             });
         }
+    }
+
+    fn schedule_preview(&mut self, dock: HWND, source: Option<HWND>) {
+        self.close_preview();
+        self.preview_candidate = source.map(|source| (dock, source));
+        unsafe {
+            let _ = KillTimer(Some(dock), 6);
+            if source.is_some() {
+                SetTimer(Some(dock), 6, 450, None);
+            }
+        }
+    }
+
+    fn cancel_preview_candidate(&mut self, dock: HWND) {
+        self.preview_candidate = None;
+        unsafe {
+            let _ = KillTimer(Some(dock), 6);
+        }
+    }
+
+    fn show_pending_preview(&mut self, dock: HWND) {
+        unsafe {
+            let _ = KillTimer(Some(dock), 6);
+        }
+        let source = self
+            .preview_candidate
+            .take()
+            .and_then(|(candidate_dock, source)| (candidate_dock == dock).then_some(source));
+        self.show_preview(dock, source);
     }
 
     fn close_preview(&mut self) {
@@ -611,6 +1517,16 @@ impl App {
                 let _ = DwmUnregisterThumbnail(preview.thumbnail);
                 let _ = DestroyWindow(preview.hwnd);
             }
+            if self.config.dock.auto_hide {
+                unsafe {
+                    SetTimer(
+                        Some(preview.dock),
+                        8,
+                        self.config.dock.auto_hide_delay_ms,
+                        None,
+                    );
+                }
+            }
         }
     }
 
@@ -620,6 +1536,15 @@ impl App {
         };
         let items = self.dock_items(hwnd);
         let Some(item) = items.get(index) else { return };
+        let keep_stack = matches!(item, DockItem::Folder(pin) if self.folder_stack.as_ref().is_some_and(|stack| stack.folder == pin.path));
+        if !keep_stack {
+            self.close_folder_stack();
+        }
+        if let DockItem::Application { windows, .. } = item
+            && (new_instance || windows.is_empty())
+        {
+            self.start_launch_bounce(hwnd, index, dock_label(item), windows.is_empty());
+        }
         match item {
             DockItem::Application { windows, .. } if !new_instance && !windows.is_empty() => {
                 let key = dock_label(item).to_lowercase();
@@ -651,22 +1576,185 @@ impl App {
         }
     }
 
+    fn mouse_down(&mut self, hwnd: HWND, x: i32) {
+        if self.kinds.get(&(hwnd.0 as isize)) != Some(&WindowKind::Dock) {
+            return;
+        }
+        let x = (x as f32 / window_scale(hwnd)).round() as i32;
+        let pin = self
+            .hover
+            .get(&(hwnd.0 as isize))
+            .copied()
+            .flatten()
+            .and_then(|index| self.dock_items(hwnd).get(index).and_then(dock_pin).cloned());
+        let Some(pin) = pin else { return };
+        self.drag = Some(DockDrag {
+            hwnd,
+            pin,
+            start_x: x,
+            active: false,
+        });
+        unsafe {
+            SetCapture(hwnd);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    fn update_drag(&mut self, hwnd: HWND, x: i32, target: Option<usize>, items: &[DockItem]) {
+        let Some(mut drag) = self.drag.take() else {
+            return;
+        };
+        if drag.hwnd != hwnd {
+            self.drag = Some(drag);
+            return;
+        }
+        let became_active = !drag.active && (x - drag.start_x).abs() >= 6;
+        drag.active |= became_active;
+        let source_index = items
+            .iter()
+            .position(|item| dock_pin(item).is_some_and(|pin| pin == &drag.pin));
+        let mut reordered = false;
+        if drag.active
+            && let Some(target_pin) = target
+                .and_then(|index| items.get(index))
+                .and_then(dock_pin)
+                .cloned()
+        {
+            reordered = swap_compatible_pins(&mut self.config.pins, &drag.pin, &target_pin);
+        }
+        if reordered
+            && !self.config.behavior.reduce_motion
+            && let (Some(from), Some(to)) = (source_index, target)
+        {
+            self.reorder_animation.insert(
+                hwnd.0 as isize,
+                ReorderAnimation {
+                    from,
+                    to,
+                    started: Instant::now(),
+                },
+            );
+            unsafe {
+                SetTimer(Some(hwnd), 9, 16, None);
+            }
+        }
+        self.drag = Some(drag);
+        if became_active {
+            self.cancel_preview_candidate(hwnd);
+            self.close_preview();
+        }
+        if became_active || reordered {
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+    }
+
+    fn mouse_up(&mut self, hwnd: HWND) {
+        let active = self
+            .drag
+            .take()
+            .filter(|drag| drag.hwnd == hwnd)
+            .is_some_and(|drag| drag.active);
+        unsafe {
+            let _ = ReleaseCapture();
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        if active {
+            let _ = self.config.save();
+            if self.config.dock.auto_hide {
+                unsafe {
+                    SetTimer(Some(hwnd), 8, self.config.dock.auto_hide_delay_ms, None);
+                }
+            }
+        } else {
+            self.left_click(hwnd);
+        }
+    }
+
+    fn cancel_drag(&mut self, hwnd: HWND) {
+        if self.drag.as_ref().is_some_and(|drag| drag.hwnd == hwnd) {
+            self.drag = None;
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+    }
+
     fn left_click(&mut self, hwnd: HWND) {
         match self.kinds.get(&(hwnd.0 as isize)).copied() {
-            Some(WindowKind::Top) => self.show_top_menu(hwnd),
+            Some(WindowKind::Top) => {
+                // Dispatch by hovered segment; fall back to the full menu when
+                // the click lands in a gap or on the logo/app cluster.
+                let segment = self
+                    .hover
+                    .get(&(hwnd.0 as isize))
+                    .copied()
+                    .flatten()
+                    .and_then(TopBarSegment::decode);
+                match segment {
+                    Some(TopBarSegment::Network) => {
+                        self.handle_command(CMD_NETWORK_SETTINGS)
+                    }
+                    Some(TopBarSegment::Volume) => self.handle_command(CMD_SOUND_SETTINGS),
+                    Some(TopBarSegment::Battery) => {
+                        self.handle_command(CMD_POWER_SETTINGS)
+                    }
+                    Some(TopBarSegment::Clock) => self.handle_command(CMD_DATE_MENU),
+                    _ => self.show_top_menu(hwnd),
+                }
+            }
             Some(WindowKind::Dock) => self.activate_dock_item(hwnd, false),
             Some(WindowKind::Preview) => {
                 if let Some(preview) = self.preview.as_ref() {
+                    let source = preview.source;
+                    let close = preview.close_hover;
                     unsafe {
-                        let _ = SetForegroundWindow(preview.source);
+                        if close {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                Some(source),
+                                WM_CLOSE,
+                                Default::default(),
+                                Default::default(),
+                            );
+                        } else {
+                            let _ = ShowWindow(source, SW_RESTORE);
+                            let _ = SetForegroundWindow(source);
+                        }
                     }
+                    self.close_preview();
                 }
             }
+            Some(WindowKind::FolderStack) => self.folder_stack_click(hwnd),
             _ => {}
         }
     }
 
+    fn folder_stack_click(&mut self, hwnd: HWND) {
+        let target = self
+            .folder_stack
+            .as_ref()
+            .filter(|stack| stack.hwnd == hwnd)
+            .and_then(|stack| {
+                if stack.footer_hover {
+                    Some(stack.folder.clone())
+                } else {
+                    stack
+                        .hover
+                        .and_then(|index| stack.entries.get(index).cloned())
+                }
+            });
+        if let Some(path) = target {
+            launch_path(&path);
+            self.close_folder_stack();
+        }
+    }
+
     fn show_menu(&mut self, hwnd: HWND) {
+        if self.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::FolderStack) {
+            self.close_folder_stack();
+            return;
+        }
         if self.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::Dock)
             && let Some(index) = self.hover.get(&(hwnd.0 as isize)).copied().flatten()
             && let Some(item) = self.dock_items(hwnd).get(index).cloned()
@@ -687,6 +1775,17 @@ impl App {
                     },
                 CMD_REDUCE_MOTION,
                 w!("Reduce motion"),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING
+                    | if self.config.dock.auto_hide {
+                        MF_CHECKED
+                    } else {
+                        Default::default()
+                    },
+                CMD_AUTO_HIDE,
+                w!("Automatically Hide and Show the Dock"),
             );
             let _ = AppendMenuW(
                 menu,
@@ -748,9 +1847,22 @@ impl App {
                 w!("Network settings"),
             );
             let _ = AppendMenuW(menu, MF_STRING, CMD_SOUND_SETTINGS, w!("Sound settings"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_POWER_SETTINGS, w!("Power & battery"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_DATE_MENU, w!("Date & time"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_VOLUME_DOWN, w!("Volume down"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_VOLUME_UP, w!("Volume up"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_VOLUME_MUTE, w!("Mute / unmute"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING
+                    | if self.config.dock.auto_hide {
+                        MF_CHECKED
+                    } else {
+                        Default::default()
+                    },
+                CMD_AUTO_HIDE,
+                w!("Automatically Hide and Show the Dock"),
+            );
             let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, w!("YumeDock settings"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(
@@ -813,6 +1925,10 @@ impl App {
             CMD_REDUCE_MOTION => {
                 self.config.behavior.reduce_motion = !self.config.behavior.reduce_motion
             }
+            CMD_AUTO_HIDE => {
+                self.config.dock.auto_hide = !self.config.dock.auto_hide;
+                self.rebuild_monitors();
+            }
             CMD_TASKBAR if !self.safe_mode => {
                 self.config.behavior.replace_taskbar = !self.config.behavior.replace_taskbar;
                 if self.config.behavior.replace_taskbar {
@@ -870,6 +1986,26 @@ impl App {
             CMD_VOLUME_DOWN => send_media_key(VK_VOLUME_DOWN.0 as u8),
             CMD_VOLUME_UP => send_media_key(VK_VOLUME_UP.0 as u8),
             CMD_VOLUME_MUTE => send_media_key(VK_VOLUME_MUTE.0 as u8),
+            CMD_POWER_SETTINGS => unsafe {
+                ShellExecuteW(
+                    None,
+                    w!("open"),
+                    w!("ms-settings:powersleep"),
+                    None,
+                    None,
+                    SW_SHOW,
+                );
+            },
+            CMD_DATE_MENU => unsafe {
+                ShellExecuteW(
+                    None,
+                    w!("open"),
+                    w!("ms-settings:datetimelanguage"),
+                    None,
+                    None,
+                    SW_SHOW,
+                );
+            },
             CMD_OPEN_ITEM | CMD_NEW_INSTANCE => {
                 if let Some(item) = self.menu_item.clone() {
                     open_item(&item, command == CMD_NEW_INSTANCE);
@@ -993,7 +2129,17 @@ impl App {
         self.rebuild_monitors();
     }
 
-    fn show_folder_stack(&self, hwnd: HWND, pin: &PinConfig) {
+    fn show_folder_stack(&mut self, hwnd: HWND, pin: &PinConfig) {
+        if self
+            .folder_stack
+            .as_ref()
+            .is_some_and(|stack| stack.folder == pin.path)
+        {
+            self.close_folder_stack();
+            return;
+        }
+        self.close_folder_stack();
+        self.close_preview();
         let mut entries: Vec<_> = std::fs::read_dir(&pin.path)
             .into_iter()
             .flatten()
@@ -1004,33 +2150,135 @@ impl App {
             path.file_name()
                 .map(|name| name.to_string_lossy().to_lowercase())
         });
-        entries.truncate(24);
+        entries.truncate(20);
+        let scale = self
+            .monitor_for(hwnd)
+            .map(|shell| shell.scale)
+            .unwrap_or_else(|| window_scale(hwnd));
+        let rows = entries.len().max(1).div_ceil(STACK_COLUMNS) as i32;
+        let width = scale_i32(
+            STACK_PADDING * 2 + STACK_CELL_WIDTH * STACK_COLUMNS as i32,
+            scale,
+        );
+        let height = scale_i32(
+            STACK_HEADER + STACK_CELL_HEIGHT * rows + STACK_FOOTER + 16,
+            scale,
+        );
+        let mut dock_rect = RECT::default();
         unsafe {
-            let menu = CreatePopupMenu().expect("folder menu");
-            let _ = AppendMenuW(menu, MF_STRING, 499, w!("Open folder"));
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            for (index, path) in entries.iter().enumerate() {
-                let label = windows::core::HSTRING::from(
-                    path.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .as_ref(),
-                );
-                let _ = AppendMenuW(menu, MF_STRING, 500 + index, &label);
-            }
-            let mut point = POINT::default();
-            let _ = GetCursorPos(&mut point);
-            let command = TrackPopupMenu(menu, TPM_RETURNCMD, point.x, point.y, Some(0), hwnd, None)
-                .0 as usize;
-            let _ = DestroyMenu(menu);
-            if command == 499 {
-                launch_path(&pin.path);
-            } else if let Some(path) = command
-                .checked_sub(500)
-                .and_then(|index| entries.get(index))
+            if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut dock_rect).is_err()
             {
-                launch_path(path);
+                return;
             }
+        }
+        let anchor_x = dock_rect.left
+            + (self
+                .cursor_x
+                .get(&(hwnd.0 as isize))
+                .copied()
+                .unwrap_or((dock_rect.right - dock_rect.left) as f32 / (2.0 * scale))
+                * scale)
+                .round() as i32;
+        let bounds = self
+            .monitor_for(hwnd)
+            .map(|shell| shell.info.bounds)
+            .unwrap_or(dock_rect);
+        let margin = scale_i32(8, scale);
+        let min_x = bounds.left + margin;
+        let max_x = (bounds.right - width - margin).max(min_x);
+        let x = (anchor_x - width / 2).clamp(min_x, max_x);
+        let icon_size = self
+            .monitor_for(hwnd)
+            .map(|shell| shell.icon_size)
+            .unwrap_or(self.config.dock.icon_size);
+        let y =
+            dock_rect.bottom - (icon_size * scale).round() as i32 - scale_i32(36, scale) - height;
+        let Ok(stack_hwnd) = create_window(x, y, width, height, false) else {
+            return;
+        };
+        configure_window_backdrop(stack_hwnd, true, self.high_contrast);
+        self.kinds
+            .insert(stack_hwnd.0 as isize, WindowKind::FolderStack);
+        self.folder_stack = Some(FolderStack {
+            hwnd: stack_hwnd,
+            dock: hwnd,
+            folder: pin.path.clone(),
+            title: pin.label.clone(),
+            entries,
+            hover: None,
+            footer_hover: false,
+            pointer_x: (anchor_x - x) as f32 / scale,
+        });
+        unsafe {
+            let _ = ShowWindow(stack_hwnd, SW_SHOWNA);
+            let _ = InvalidateRect(Some(stack_hwnd), None, false);
+        }
+    }
+
+    fn close_folder_stack(&mut self) {
+        if let Some(stack) = self.folder_stack.take() {
+            self.kinds.remove(&(stack.hwnd.0 as isize));
+            self.renderer.forget(stack.hwnd);
+            unsafe {
+                let _ = DestroyWindow(stack.hwnd);
+                if self.config.dock.auto_hide {
+                    SetTimer(
+                        Some(stack.dock),
+                        8,
+                        self.config.dock.auto_hide_delay_ms,
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    fn folder_stack_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), 10);
+        }
+        let mut rect = RECT::default();
+        if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
+            return;
+        }
+        let height = ((rect.bottom - rect.top) as f32 / window_scale(hwnd)).round() as i32;
+        let footer_top = height - 10 - STACK_FOOTER;
+        let hover = if x >= STACK_PADDING
+            && x < STACK_PADDING + STACK_CELL_WIDTH * STACK_COLUMNS as i32
+            && y >= STACK_HEADER
+            && y < footer_top
+        {
+            let column = ((x - STACK_PADDING) / STACK_CELL_WIDTH) as usize;
+            let row = ((y - STACK_HEADER) / STACK_CELL_HEIGHT) as usize;
+            Some(row * STACK_COLUMNS + column)
+        } else {
+            None
+        };
+        let footer_hover = x >= 9 && x <= rect.right - 9 && y >= footer_top && y < rect.bottom - 10;
+        let Some(stack) = self
+            .folder_stack
+            .as_mut()
+            .filter(|stack| stack.hwnd == hwnd)
+        else {
+            return;
+        };
+        let hover = hover.filter(|index| *index < stack.entries.len());
+        let changed = stack.hover != hover || stack.footer_hover != footer_hover;
+        stack.hover = hover;
+        stack.footer_hover = footer_hover;
+        if changed {
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+        let mut track = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = TrackMouseEvent(&mut track);
         }
     }
 }
@@ -1043,6 +2291,17 @@ fn with_app(f: impl FnOnce(&mut App)) {
             f(app);
         }
     });
+}
+
+fn with_app_value<T>(default: T, f: impl FnOnce(&mut App) -> T) -> T {
+    APP.with(|slot| {
+        if let Ok(mut state) = slot.try_borrow_mut()
+            && let Some(app) = state.as_mut()
+        {
+            return f(app);
+        }
+        default
+    })
 }
 
 unsafe extern "system" fn window_proc(
@@ -1060,6 +2319,19 @@ unsafe extern "system" fn window_proc(
         return LRESULT(0);
     }
     match msg {
+        WM_NCHITTEST => {
+            let screen_x = (lparam.0 as i16) as i32;
+            let screen_y = ((lparam.0 >> 16) as i16) as i32;
+            if let Some(hit) =
+                with_app_value(None, |app| app.dock_hit_region(hwnd, screen_x, screen_y))
+            {
+                return LRESULT(if hit {
+                    HTCLIENT as isize
+                } else {
+                    HTTRANSPARENT as isize
+                });
+            }
+        }
         WM_PAINT => {
             with_app(|app| app.paint(hwnd));
             return LRESULT(0);
@@ -1075,15 +2347,29 @@ unsafe extern "system" fn window_proc(
             return LRESULT(0);
         }
         WM_MOUSEMOVE => {
-            with_app(|app| app.mouse_move(hwnd, (lparam.0 as i16) as i32));
+            with_app(|app| {
+                app.mouse_move(
+                    hwnd,
+                    (lparam.0 as i16) as i32,
+                    ((lparam.0 >> 16) as i16) as i32,
+                )
+            });
             return LRESULT(0);
         }
         WM_MOUSELEAVE => {
             with_app(|app| app.mouse_leave(hwnd));
             return LRESULT(0);
         }
+        WM_LBUTTONDOWN => {
+            with_app(|app| app.mouse_down(hwnd, (lparam.0 as i16) as i32));
+            return LRESULT(0);
+        }
         WM_LBUTTONUP => {
-            with_app(|app| app.left_click(hwnd));
+            with_app(|app| app.mouse_up(hwnd));
+            return LRESULT(0);
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|app| app.cancel_drag(hwnd));
             return LRESULT(0);
         }
         WM_MBUTTONUP => {
@@ -1106,16 +2392,44 @@ unsafe extern "system" fn window_proc(
             with_app(|app| app.close_preview());
             return LRESULT(0);
         }
+        WM_TIMER if wparam.0 == 4 => {
+            with_app(|app| app.animate_launch_bounce(hwnd));
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == 5 => {
+            with_app(|app| app.process_window_refresh(hwnd));
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == 6 => {
+            with_app(|app| app.show_pending_preview(hwnd));
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == 7 => {
+            with_app(|app| app.animate_auto_hide(hwnd));
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == 8 => {
+            with_app(|app| app.begin_auto_hide(hwnd));
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == 9 => {
+            with_app(|app| app.animate_reorder(hwnd));
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == 10 => {
+            with_app(|app| app.close_folder_stack());
+            return LRESULT(0);
+        }
         WM_TIMER => {
             let _ = InvalidateRect(Some(hwnd), None, false);
             return LRESULT(0);
         }
-        WM_DISPLAYCHANGE => {
-            with_app(|app| app.rebuild_monitors());
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            with_app(|app| app.schedule_monitor_rebuild());
             return LRESULT(0);
         }
         WM_SETTINGCHANGE => {
-            with_app(|app| app.refresh_windows());
+            with_app(|app| app.refresh_system_settings());
             return LRESULT(0);
         }
         WM_HOTKEY if wparam.0 as i32 == HOTKEY_RESTORE => {
@@ -1154,7 +2468,7 @@ fn register_window_class() -> Result<()> {
 fn create_window(x: i32, y: i32, width: i32, height: i32, bar: bool) -> Result<HWND> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
-        let ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED;
+        let ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP;
         let hwnd = CreateWindowExW(
             ex,
             CLASS_NAME,
@@ -1169,18 +2483,7 @@ fn create_window(x: i32, y: i32, width: i32, height: i32, bar: bool) -> Result<H
             Some(instance.into()),
             None,
         )?;
-        SetLayeredWindowAttributes(
-            hwnd,
-            Default::default(),
-            if bar { 236 } else { 248 },
-            LWA_ALPHA,
-        )?;
-        if !bar {
-            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 32, 32);
-            if !region.is_invalid() {
-                SetWindowRgn(hwnd, Some(region), true);
-            }
-        }
+        let _ = bar;
         DragAcceptFiles(hwnd, true);
         Ok(hwnd)
     }
@@ -1199,22 +2502,73 @@ fn dock_label(item: &DockItem) -> String {
         DockItem::Application {
             identity: Some(identity),
             ..
-        } => identity.display_name.clone(),
+        } => friendly_app_name(&identity.display_name),
         DockItem::Application { .. } => "App".into(),
         DockItem::RecycleBin => "Recycle Bin".into(),
     }
 }
 
-fn dock_icon_path(item: &DockItem) -> Option<std::path::PathBuf> {
+fn dock_pin(item: &DockItem) -> Option<&PinConfig> {
     match item {
-        DockItem::Application { pin: Some(pin), .. } => Some(preferred_pin_icon(pin)),
-        DockItem::Folder(pin) => Some(pin.path.clone()),
+        DockItem::Application { pin: Some(pin), .. } | DockItem::Folder(pin) => Some(pin),
+        _ => None,
+    }
+}
+
+fn swap_compatible_pins(pins: &mut [PinConfig], source: &PinConfig, target: &PinConfig) -> bool {
+    if source == target
+        || source.kind == PinKind::RecycleBin
+        || target.kind == PinKind::RecycleBin
+        || source.kind != target.kind
+    {
+        return false;
+    }
+    let Some(from) = pins.iter().position(|pin| pin == source) else {
+        return false;
+    };
+    let Some(to) = pins.iter().position(|pin| pin == target) else {
+        return false;
+    };
+    pins.swap(from, to);
+    true
+}
+
+fn dock_icon_paths(item: &DockItem) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    match item {
+        DockItem::Application {
+            pin: Some(pin),
+            identity,
+            ..
+        } => (
+            Some(preferred_pin_icon(pin)),
+            identity
+                .as_ref()
+                .map(|identity| identity.executable.clone()),
+        ),
+        DockItem::Folder(pin) => (Some(pin.path.clone()), None),
         DockItem::Application {
             identity: Some(identity),
             ..
-        } => Some(identity.executable.clone()),
-        DockItem::RecycleBin => Some(std::path::PathBuf::from(r"C:\$Recycle.Bin")),
-        _ => None,
+        } => {
+            let app_id_icon = identity
+                .app_user_model_id
+                .as_ref()
+                .map(|id| std::path::PathBuf::from(format!(r"shell:AppsFolder\{id}")));
+            let executable = identity.executable.clone();
+            let packaged = executable
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("\\windowsapps\\");
+            if packaged {
+                (
+                    app_id_icon.or_else(|| Some(executable.clone())),
+                    Some(executable),
+                )
+            } else {
+                (Some(executable), app_id_icon)
+            }
+        }
+        DockItem::RecycleBin | DockItem::Application { .. } => (None, None),
     }
 }
 
@@ -1227,16 +2581,22 @@ fn preferred_pin_icon(pin: &crate::config::PinConfig) -> std::path::PathBuf {
     let Some(path) = pin.identity_path.as_ref() else {
         return pin.path.clone();
     };
+    if path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("Update.exe"))
+    {
+        return pin.path.clone();
+    }
     let raw = path.to_string_lossy();
     let expanded = if raw
-        .get(..9)
+        .get(..8)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("%windir%"))
     {
         std::env::var_os("WINDIR")
             .map(std::path::PathBuf::from)
             .map(|root| {
                 root.join(
-                    raw.get(9..)
+                    raw.get(8..)
                         .unwrap_or_default()
                         .trim_start_matches(['\\', '/']),
                 )
@@ -1308,6 +2668,7 @@ fn friendly_app_name(process_name: &str) -> String {
         "explorer" => "File Explorer".into(),
         "steamwebhelper" => "Steam".into(),
         "applicationframehost" => "Windows App".into(),
+        "valorant-win64-shipping" => "VALORANT".into(),
         _ => process_name.to_string(),
     }
 }
@@ -1330,6 +2691,189 @@ fn current_clock(use_24: bool) -> String {
     }
 }
 
+/// Compact "Wed 14 Jul" style date for the menu-bar clock segment. Uses the
+/// raw `GetLocalTime` directly (rather than `chrono_like_local_time`) because
+/// it also needs the day-of-week, which that helper discards.
+fn current_date() -> String {
+    let time = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let weekday = WEEKDAYS
+        .get(time.wDayOfWeek as usize)
+        .copied()
+        .unwrap_or("???");
+    let month = MONTHS
+        .get((time.wMonth as usize).saturating_sub(1))
+        .copied()
+        .unwrap_or("???");
+    format!("{weekday} {day} {month}", day = time.wDay)
+}
+
+fn rounded_rect_contains(
+    x: f32,
+    y: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    radius: f32,
+) -> bool {
+    if x < left || x > right || y < top || y > bottom {
+        return false;
+    }
+    let nearest_x = x.clamp(left + radius, right - radius);
+    let nearest_y = y.clamp(top + radius, bottom - radius);
+    let dx = x - nearest_x;
+    let dy = y - nearest_y;
+    dx * dx + dy * dy <= radius * radius
+}
+
+#[derive(Clone, Copy)]
+struct LaunchBounceFrame {
+    offset: f32,
+    scale_x: f32,
+    scale_y: f32,
+}
+
+fn launch_bounce_frame(elapsed: Duration, icon_size: f32) -> LaunchBounceFrame {
+    let cycle = (elapsed.as_secs_f32() % 0.62) / 0.62;
+    if cycle < 0.82 {
+        let airborne = cycle / 0.82;
+        let offset = (airborne * std::f32::consts::PI).sin().max(0.0).powf(0.84) * icon_size * 0.42;
+        let stretch = if airborne < 0.18 {
+            (airborne / 0.18 * std::f32::consts::PI).sin().max(0.0)
+        } else {
+            0.0
+        };
+        LaunchBounceFrame {
+            offset,
+            scale_x: 1.0 - 0.018 * stretch,
+            scale_y: 1.0 + 0.035 * stretch,
+        }
+    } else {
+        let landing = (cycle - 0.82) / 0.18;
+        let squash = (landing * std::f32::consts::PI).sin().max(0.0);
+        LaunchBounceFrame {
+            offset: 0.0,
+            scale_x: 1.0 + 0.055 * squash,
+            scale_y: 1.0 - 0.075 * squash,
+        }
+    }
+}
+
+fn approach_value(value: f32, target: f32, elapsed: Duration, duration: Duration) -> f32 {
+    if duration.is_zero() {
+        return target;
+    }
+    let blend = 1.0 - (-4.605 * elapsed.as_secs_f32() / duration.as_secs_f32()).exp();
+    value + (target - value) * blend.clamp(0.0, 1.0)
+}
+
+fn scale_i32(value: i32, scale: f32) -> i32 {
+    (value as f32 * scale.max(1.0)).round() as i32
+}
+
+fn window_scale(hwnd: HWND) -> f32 {
+    unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 }
+}
+
+/// Client size of `hwnd` in device-independent pixels (DIPs), accounting for
+/// the per-window DPI scale.
+fn client_size_dips(hwnd: HWND, scale: f32) -> (f32, f32) {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rect);
+    }
+    let width = ((rect.right - rect.left) as f32 / scale).max(1.0);
+    let height = ((rect.bottom - rect.top) as f32 / scale).max(1.0);
+    (width, height)
+}
+
+fn high_contrast_enabled() -> bool {
+    let mut high_contrast = HIGHCONTRASTW {
+        cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            high_contrast.cbSize,
+            Some((&mut high_contrast as *mut HIGHCONTRASTW).cast()),
+            Default::default(),
+        )
+        .is_ok()
+            && high_contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
+    }
+}
+
+fn configure_window_backdrop(hwnd: HWND, rounded: bool, high_contrast: bool) {
+    if high_contrast {
+        return;
+    }
+    let dark_mode = BOOL(1);
+    let backdrop = DWMSBT_TRANSIENTWINDOW;
+    let corner = if rounded {
+        DWMWCP_ROUND
+    } else {
+        DWMWCP_DONOTROUND
+    };
+    let margins = MARGINS {
+        cxLeftWidth: -1,
+        cxRightWidth: -1,
+        cyTopHeight: -1,
+        cyBottomHeight: -1,
+    };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark_mode as *const BOOL).cast(),
+            std::mem::size_of_val(&dark_mode) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&backdrop as *const windows::Win32::Graphics::Dwm::DWM_SYSTEMBACKDROP_TYPE).cast(),
+            std::mem::size_of_val(&backdrop) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&corner as *const windows::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            std::mem::size_of_val(&corner) as u32,
+        );
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
+}
+
+fn preview_content_rect(source: SIZE, width: i32, height: i32, scale: f32) -> RECT {
+    let padding = scale_i32(8, scale);
+    let header = scale_i32(36, scale);
+    let pointer_and_bottom = scale_i32(18, scale);
+    let available_width = (width - padding * 2).max(1);
+    let available_height = (height - header - pointer_and_bottom).max(1);
+    let source_width = source.cx.max(1) as f32;
+    let source_height = source.cy.max(1) as f32;
+    let scale =
+        (available_width as f32 / source_width).min(available_height as f32 / source_height);
+    let fitted_width = (source_width * scale).round().max(1.0) as i32;
+    let fitted_height = (source_height * scale).round().max(1.0) as i32;
+    let left = (width - fitted_width) / 2;
+    let top = header + (available_height - fitted_height) / 2;
+    RECT {
+        left,
+        top,
+        right: left + fitted_width,
+        bottom: top + fitted_height,
+    }
+}
+
+fn ease_out_quart(progress: f32) -> f32 {
+    1.0 - (1.0 - progress.clamp(0.0, 1.0)).powi(4)
+}
+
 fn chrono_like_local_time() -> (i32, u32, u32, u32, u32) {
     let time = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
     (
@@ -1345,12 +2889,95 @@ use std::os::windows::ffi::OsStrExt;
 
 #[cfg(test)]
 mod label_tests {
-    use super::friendly_app_name;
+    use super::{
+        PinConfig, PinKind, SIZE, approach_value, ease_out_quart, friendly_app_name,
+        launch_bounce_frame, preview_content_rect, rounded_rect_contains, scale_i32,
+        swap_compatible_pins,
+    };
+    use std::{path::PathBuf, time::Duration};
+
+    fn pin(label: &str, kind: PinKind) -> PinConfig {
+        PinConfig {
+            label: label.into(),
+            path: PathBuf::from(label),
+            identity_path: None,
+            kind,
+        }
+    }
 
     #[test]
     fn replaces_raw_windows_process_names() {
         assert_eq!(friendly_app_name("msedge"), "Microsoft Edge");
         assert_eq!(friendly_app_name("explorer"), "File Explorer");
         assert_eq!(friendly_app_name("YumePlayer"), "YumePlayer");
+    }
+
+    #[test]
+    fn rounded_dock_hit_region_excludes_transparent_corners() {
+        assert!(rounded_rect_contains(
+            20.0, 10.0, 0.0, 0.0, 100.0, 50.0, 18.0
+        ));
+        assert!(!rounded_rect_contains(
+            1.0, 1.0, 0.0, 0.0, 100.0, 50.0, 18.0
+        ));
+    }
+
+    #[test]
+    fn launch_bounce_has_a_clear_mac_style_peak() {
+        assert_eq!(launch_bounce_frame(Duration::ZERO, 48.0).offset, 0.0);
+        assert!(launch_bounce_frame(Duration::from_millis(250), 48.0).offset > 19.0);
+        let landing = launch_bounce_frame(Duration::from_millis(565), 48.0);
+        assert!(landing.scale_y < 0.95);
+        assert!(landing.scale_x > 1.03);
+    }
+
+    #[test]
+    fn time_based_motion_reaches_same_point_at_different_frame_rates() {
+        let duration = Duration::from_millis(160);
+        let one_step = approach_value(0.0, 1.0, duration, duration);
+        let mut many_steps = 0.0;
+        for _ in 0..10 {
+            many_steps = approach_value(many_steps, 1.0, Duration::from_millis(16), duration);
+        }
+        assert!((one_step - many_steps).abs() < 0.001);
+    }
+
+    #[test]
+    fn preview_preserves_wide_window_aspect_ratio() {
+        let rect = preview_content_rect(SIZE { cx: 1920, cy: 1080 }, 336, 232, 1.0);
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        assert!(((width as f32 / height as f32) - (16.0 / 9.0)).abs() < 0.02);
+        assert!(rect.top >= 36);
+        assert!(rect.bottom <= 214);
+    }
+
+    #[test]
+    fn dpi_scaling_keeps_logical_geometry_proportional() {
+        assert_eq!(scale_i32(32, 1.0), 32);
+        assert_eq!(scale_i32(32, 1.25), 40);
+        assert_eq!(scale_i32(48, 2.0), 96);
+        let preview = preview_content_rect(SIZE { cx: 1920, cy: 1080 }, 672, 464, 2.0);
+        assert!(preview.top >= 72);
+        assert!(preview.bottom <= 428);
+    }
+
+    #[test]
+    fn drag_reorders_apps_but_never_recycle_bin() {
+        let first = pin("First", PinKind::Application);
+        let second = pin("Second", PinKind::Application);
+        let recycle = pin("Recycle Bin", PinKind::RecycleBin);
+        let mut pins = vec![first.clone(), second.clone(), recycle.clone()];
+        assert!(swap_compatible_pins(&mut pins, &first, &second));
+        assert_eq!(pins[0], second);
+        assert!(!swap_compatible_pins(&mut pins, &first, &recycle));
+        assert_eq!(pins.last(), Some(&recycle));
+    }
+
+    #[test]
+    fn reorder_settling_uses_fast_ease_out() {
+        assert_eq!(ease_out_quart(0.0), 0.0);
+        assert!(ease_out_quart(0.5) > 0.9);
+        assert_eq!(ease_out_quart(1.0), 1.0);
     }
 }

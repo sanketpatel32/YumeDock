@@ -1,0 +1,102 @@
+name: release
+
+# Builds YumeDock, produces the Inno Setup installer, and publishes a rolling
+# "latest" GitHub Release on every push to main. The one-line install command
+# (install.ps1) always pulls the newest build from this rolling release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # Manual "Run workflow" button as a fallback.
+
+permissions:
+  contents: write # Required by `gh release create/delete`.
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+
+      - name: Generate app icon
+        shell: pwsh
+        run: python assets/make_icon.py
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          # Read the version from Cargo.toml and append the short commit SHA so
+          # each rolling build is distinguishable.
+          $cargoVersion = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          $sha = ${env:GITHUB_SHA}.Substring(0,7)
+          $version = "$cargoVersion+$sha"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Version: $version"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          # ISCC.exe ships pre-installed on the windows-latest runner image.
+          $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue
+          if (-not $iscc) { throw "Inno Setup 6 (ISCC.exe) not found on runner" }
+          & $iscc.FullName `
+            /DAPP_VERSION="${{ steps.version.outputs.version }}" `
+            /DAPP_SOURCE="..\target\release\YumeDock.exe" `
+            installer\yumedock.iss
+          if (-not (Test-Path "installer\Output\YumeDock-Setup.exe")) {
+            throw "Installer was not produced"
+          }
+
+      - name: Delete previous rolling release
+        shell: pwsh
+        run: |
+          # The "latest" tag is a rolling pre-release; replace it on every push.
+          gh release delete latest --cleanup-tag --yes 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Host "No prior latest release to delete (continuing)." }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish rolling release
+        shell: pwsh
+        run: |
+          $notes = @"
+          **Automatic build of commit ${{ github.sha }}**
+
+          - \`YumeDock-Setup.exe\` - recommended installer (Start Menu entry, uninstaller, auto-updates your existing settings).
+          - \`YumeDock.exe\` - portable build, no installer.
+
+          Install with one line in PowerShell:
+          ``````powershell
+          irm https://raw.githubusercontent.com/sanketpatel32/YumeDock/main/install.ps1 | iex
+          ``````
+
+          Emergency restore (if the Windows taskbar is hidden): **Ctrl+Alt+Shift+F12**.
+          "@
+          gh release create latest `
+            installer\Output\YumeDock-Setup.exe `
+            target\release\YumeDock.exe `
+            --title "YumeDock (latest build)" `
+            --notes $notes `
+            --prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

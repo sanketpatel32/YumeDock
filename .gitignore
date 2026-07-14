@@ -3,3 +3,9 @@
 *.ilk
 *.log
 
+# Inno Setup build output (produced by iscc / the CI workflow).
+installer/Output/
+
+# Local agent session state.
+.zcode/
+

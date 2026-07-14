@@ -20,6 +20,8 @@ pub struct DockConfig {
     pub animation_ms: u32,
     pub opacity: f32,
     pub height: i32,
+    pub auto_hide: bool,
+    pub auto_hide_delay_ms: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,6 +83,8 @@ impl Default for DockConfig {
             animation_ms: 160,
             opacity: 0.82,
             height: 76,
+            auto_hide: true,
+            auto_hide_delay_ms: 650,
         }
     }
 }
@@ -154,6 +158,7 @@ impl ConfigV1 {
         self.dock.animation_ms = self.dock.animation_ms.clamp(0, 500);
         self.dock.opacity = self.dock.opacity.clamp(0.35, 1.0);
         self.dock.height = self.dock.height.clamp(56, 120);
+        self.dock.auto_hide_delay_ms = self.dock.auto_hide_delay_ms.clamp(100, 5000);
         self.top_bar.height = self.top_bar.height.clamp(26, 48);
         self.top_bar.opacity = self.top_bar.opacity.clamp(0.35, 1.0);
         self.pins
@@ -248,10 +253,12 @@ mod tests {
         let mut c = ConfigV1::default();
         c.dock.icon_size = 500.0;
         c.dock.opacity = -2.0;
+        c.dock.auto_hide_delay_ms = 1;
         c.top_bar.height = 2;
         c.validate();
         assert_eq!(c.dock.icon_size, 80.0);
         assert_eq!(c.dock.opacity, 0.35);
+        assert_eq!(c.dock.auto_hide_delay_ms, 100);
         assert_eq!(c.top_bar.height, 26);
     }
 }

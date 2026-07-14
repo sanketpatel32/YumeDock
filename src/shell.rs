@@ -1,15 +1,20 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use anyhow::{Context, Result};
-use std::{env, process::Command, time::Duration};
+use std::{
+    env,
+    process::Command,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HWND, LPARAM},
         System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
         UI::{
             Shell::{
-                ABE_BOTTOM, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA,
-                SHAppBarMessage,
+                ABE_BOTTOM, ABE_TOP, ABM_GETSTATE, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS,
+                ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage,
             },
             WindowsAndMessaging::{
                 EnumWindows, FindWindowW, IsWindowVisible, SW_HIDE, SW_SHOW, ShowWindow,
@@ -19,14 +24,18 @@ use windows::{
     core::PCWSTR,
 };
 
+static SUPPRESS_TASKBAR: AtomicBool = AtomicBool::new(false);
+
 #[derive(Debug, Default)]
 pub struct TaskbarState {
     windows: Vec<(HWND, bool)>,
+    appbar_state: u32,
     hidden: bool,
 }
 
 impl TaskbarState {
     pub fn capture() -> Self {
+        let appbar_state = get_taskbar_appbar_state();
         let windows = taskbar_windows()
             .into_iter()
             .map(|hwnd| {
@@ -36,11 +45,14 @@ impl TaskbarState {
             .collect();
         Self {
             windows,
+            appbar_state,
             hidden: false,
         }
     }
 
     pub fn hide(&mut self) {
+        SUPPRESS_TASKBAR.store(true, Ordering::Release);
+        set_taskbar_appbar_state(self.appbar_state | ABS_AUTOHIDE);
         for (hwnd, _) in &self.windows {
             unsafe {
                 let _ = ShowWindow(*hwnd, SW_HIDE);
@@ -50,7 +62,14 @@ impl TaskbarState {
     }
 
     pub fn refresh_and_hide(&mut self) {
-        *self = Self::capture();
+        self.windows = taskbar_windows()
+            .into_iter()
+            .map(|hwnd| {
+                let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+                (hwnd, visible)
+            })
+            .collect();
+        self.hidden = false;
         self.hide();
     }
 
@@ -58,6 +77,7 @@ impl TaskbarState {
         if !self.hidden {
             return;
         }
+        SUPPRESS_TASKBAR.store(false, Ordering::Release);
         for (hwnd, was_visible) in &self.windows {
             if *was_visible {
                 unsafe {
@@ -65,8 +85,25 @@ impl TaskbarState {
                 }
             }
         }
+        set_taskbar_appbar_state(self.appbar_state);
         self.hidden = false;
     }
+}
+
+pub fn should_suppress_taskbar() -> bool {
+    SUPPRESS_TASKBAR.load(Ordering::Acquire)
+}
+
+pub fn is_taskbar_window(hwnd: HWND) -> bool {
+    let mut class = [0u16; 64];
+    let len = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class) };
+    if len <= 0 {
+        return false;
+    }
+    matches!(
+        &String::from_utf16_lossy(&class[..len as usize])[..],
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    )
 }
 
 impl Drop for TaskbarState {
@@ -76,9 +113,13 @@ impl Drop for TaskbarState {
 }
 
 unsafe extern "system" fn collect_secondary(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
-    let mut class = [0u16; 64];
-    let len = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class);
-    if len > 0 && String::from_utf16_lossy(&class[..len as usize]) == "Shell_SecondaryTrayWnd" {
+    if is_taskbar_window(hwnd) {
+        let mut class = [0u16; 64];
+        let len = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class);
+        if len <= 0 || String::from_utf16_lossy(&class[..len as usize]) != "Shell_SecondaryTrayWnd"
+        {
+            return windows::core::BOOL(1);
+        }
         (*(lparam.0 as *mut Vec<HWND>)).push(hwnd);
     }
     windows::core::BOOL(1)
@@ -109,17 +150,38 @@ pub fn force_restore_taskbars() {
     }
 }
 
+fn get_taskbar_appbar_state() -> u32 {
+    let mut data = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        ..Default::default()
+    };
+    unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) as u32 }
+}
+
+fn set_taskbar_appbar_state(state: u32) {
+    let mut data = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        lParam: windows::Win32::Foundation::LPARAM(state as isize),
+        ..Default::default()
+    };
+    unsafe {
+        SHAppBarMessage(ABM_SETSTATE, &mut data);
+    }
+}
+
 pub fn spawn_watchdog() -> Result<()> {
     let exe = env::current_exe().context("locate YumeDock executable")?;
+    let appbar_state = get_taskbar_appbar_state();
     Command::new(exe)
         .arg("--watchdog")
         .arg(std::process::id().to_string())
+        .arg(appbar_state.to_string())
         .spawn()
         .context("start taskbar watchdog")?;
     Ok(())
 }
 
-pub fn run_watchdog(pid: u32) -> Result<()> {
+pub fn run_watchdog(pid: u32, appbar_state: u32) -> Result<()> {
     unsafe {
         let process =
             OpenProcess(PROCESS_SYNCHRONIZE, false, pid).context("open YumeDock process")?;
@@ -128,6 +190,7 @@ pub fn run_watchdog(pid: u32) -> Result<()> {
     }
     std::thread::sleep(Duration::from_millis(100));
     force_restore_taskbars();
+    set_taskbar_appbar_state(appbar_state);
     Ok(())
 }
 
