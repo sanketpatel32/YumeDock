@@ -12,9 +12,9 @@ Open **PowerShell** and paste this one line:
 irm https://raw.githubusercontent.com/sanketpatel32/YumeDock/main/install.ps1 | iex
 ```
 
-This downloads the latest `YumeDock-Setup.exe` and installs it **per-user** — no administrator prompt, no UAC. Launch it from the Start Menu afterward (search "YumeDock").
+This downloads the latest `YumeDock.exe` to `%LOCALAPPDATA%\Programs\YumeDock` and creates a Start Menu shortcut — no installer, no admin prompt. Launch it from the Start Menu afterward (search "YumeDock").
 
-> Windows SmartScreen may warn the first time because the installer isn't code-signed yet. Click **More info → Run anyway**. See [Releases](https://github.com/sanketpatel32/YumeDock/releases) to download manually.
+> Windows SmartScreen may warn the first time because the exe isn't code-signed yet. Click **More info → Run anyway**. See [Releases](https://github.com/sanketpatel32/YumeDock/releases) to download manually.
 
 ---
 
@@ -28,7 +28,7 @@ YumeDock hides the Windows taskbar by default. You can **always** get it back:
 | Right-click the top bar → *Restore taskbar and quit* | Normal shutdown with restore. |
 | Task Manager → end `YumeDock` | The watchdog restores the taskbar on crash/kill. |
 
-**Want to try it without hiding your taskbar?** Launch the *YumeDock (safe mode)* Start Menu shortcut, or run `YumeDock.exe --safe-mode`. The dock and top bar appear, but the Windows taskbar stays visible.
+**Want to try it without hiding your taskbar?** Run `YumeDock.exe --safe-mode`. The dock and top bar appear, but the Windows taskbar stays visible.
 
 ---
 
@@ -38,7 +38,7 @@ YumeDock hides the Windows taskbar by default. You can **always** get it back:
 - **Dock** — a macOS-style dock with smooth magnification, running-app indicators, drag-to-reorder pins, and folder/recycle-bin stacks. Imported automatically from your existing taskbar pins on first run.
 - **Native and light** — pure Rust + Direct2D/DirectComposition. No Electron, no WebView, no browser layer.
 
-Settings live in `%LOCALAPPDATA%\YumeDock\config.json` and **survive uninstall/reinstall**.
+Settings live in `%LOCALAPPDATA%\YumeDock\config.json` and **survive updates**.
 
 ---
 
@@ -63,58 +63,47 @@ Toggle the right-side menu-bar segments, dock magnification, auto-hide, and whet
 
 ---
 
-## Build from source
+## Releasing (build on your own PC)
 
-Requires the [Rust toolchain](https://rustup.rs/) (stable) and, for the embedded app icon, Python 3.
-
-```powershell
-# Generate the app icon (stdlib Python, no extra packages):
-python assets/make_icon.py
-
-# Build:
-cargo build --release
-
-# The portable executable:
-target\release\YumeDock.exe
-```
-
-The icon is embedded via `build.rs` + `embed-resource`. If `assets/yumedock.ico` is absent, the build still succeeds (just without the icon).
-
-Run tests:
+There is no CI pipeline — releases are built locally. One script does everything:
 
 ```powershell
-cargo test
+.\build-release.ps1 -Latest
 ```
 
-### Produce the installer locally
+This:
+1. Generates the app icon (`python assets/make_icon.py`).
+2. Builds the release binary (`cargo build --release`) with the icon embedded.
+3. Zips the exe + a short README into `dist\`.
+4. Publishes a GitHub Release (rolling **`latest`** tag) with `YumeDock.exe` and the zip attached.
 
+The one-line install command at the top always pulls from that `latest` release, so re-running `.\build-release.ps1 -Latest` updates everyone.
+
+**Requirements to build:** Rust toolchain, Python 3, and the [GitHub CLI](https://cli.github.com/) (`gh auth login` once).
+
+Other options:
 ```powershell
-# Install Inno Setup 6 (https://jrsoftware.org/isdl.php), then:
-iscc /DAPP_VERSION=0.1.0 /DAPP_SOURCE="..\target\release\YumeDock.exe" installer\yumedock.iss
-# -> installer\Output\YumeDock-Setup.exe
+.\build-release.ps1                  # versioned as <cargo-version>+<git-sha>
+.\build-release.ps1 -Tag v0.2.0      # explicit versioned release
 ```
-
----
-
-## How releases work
-
-Every push to `main` triggers the [`release`](.github/workflows/release.yml) GitHub Actions workflow, which:
-
-1. Builds the release binary (with the embedded icon).
-2. Runs the test suite.
-3. Compiles the Inno Setup installer.
-4. Publishes both to a rolling **`latest`** [Release](https://github.com/sanketpatel32/YumeDock/releases) (pre-release), replacing the previous one.
-
-The one-line install command always pulls the newest build from that rolling release. To update an existing install later, just re-run the one-liner.
 
 ---
 
 ## Uninstall
 
-Settings → Apps → *YumeDock* → Uninstall. The install directory is removed; your `config.json` (in `%LOCALAPPDATA%\YumeDock`) is preserved.
+Delete the install folder (`%LOCALAPPDATA%\Programs\YumeDock`) and the Start Menu shortcut. To keep your settings or start fresh: `%LOCALAPPDATA%\YumeDock\config.json`.
 
 ---
 
-## License
+## Build from source (development)
 
-See the repository for licensing terms.
+Requires the [Rust toolchain](https://rustup.rs/) (stable) and Python 3 for the icon.
+
+```powershell
+python assets\make_icon.py     # generate the app icon (stdlib, no packages)
+cargo build --release
+target\release\YumeDock.exe
+cargo test                     # 20 unit tests
+```
+
+If `assets/yumedock.ico` is absent, the build still succeeds (just without the icon).
