@@ -106,9 +106,21 @@ if ($LASTEXITCODE -ne 0) { Fail "GitHub CLI (gh) not found. Install it and run '
 $remote = (git remote get-url origin)
 Write-Host "  remote: $remote"
 
-# Delete an existing release at this tag so re-runs are clean.
-$existing = gh release view $tagName --json url 2>$null
-if ($LASTEXITCODE -eq 0) {
+# Delete an existing release at this tag so re-runs are clean. The `view` call
+# writes "release not found" to stderr when absent; under
+# $ErrorActionPreference=Stop (WinPS 5.1) that becomes a terminating error, so
+# guard it with a try/catch and a local relaxed error preference.
+$alreadyExists = $false
+try {
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $null = gh release view $tagName --json url 2>$null
+    if ($LASTEXITCODE -eq 0) { $alreadyExists = $true }
+    $ErrorActionPreference = $prevPref
+} catch {
+    $ErrorActionPreference = $prevPref
+}
+if ($alreadyExists) {
     Write-Host "  deleting existing release at $tagName..."
     gh release delete $tagName --cleanup-tag --yes
     if ($LASTEXITCODE -ne 0) { Fail "could not delete existing release" }
