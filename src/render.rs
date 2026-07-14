@@ -74,7 +74,7 @@ const BAR_SEGMENT_GAP: f32 = 4.0;
 /// Fixed widths of the icon-only right-side segments (DIPs).
 const BAR_SEGMENT_ICON_WIDTH: f32 = 26.0;
 /// Width of the clock segment (date + time), wide enough for "Wed 14 Jul  10:04 AM".
-const BAR_SEGMENT_CLOCK_WIDTH: f32 = 150.0;
+const BAR_SEGMENT_CLOCK_WIDTH: f32 = 168.0;
 /// Reserved left-cluster width: mark + bold app name.
 const BAR_LEFT_MARK_RADIUS: f32 = 4.5;
 const BAR_LEFT_MARK_OFFSET: f32 = 14.0;
@@ -574,9 +574,13 @@ impl Renderer {
                         if hover == Some(TopBarSegment::Clock) {
                             fill_pill(&surface.context, rect, &pill_fill);
                         }
-                        // Date (small) leading, then time (body) trailing inside the rect.
+                        // Date (small) leading in the left half, time (body)
+                        // trailing in the right half, with a clean gap so they
+                        // never overlap regardless of locale string width.
                         let date_text: Vec<u16> = date.encode_utf16().collect();
                         let clock_text: Vec<u16> = clock.encode_utf16().collect();
+                        let gap = 8.0;
+                        let mid = rect.left + rect.width() / 2.0;
                         small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
                         surface.context.DrawText(
                             &date_text,
@@ -584,7 +588,7 @@ impl Renderer {
                             &D2D_RECT_F {
                                 left: rect.left + BAR_SEGMENT_PAD_X,
                                 top: 0.0,
-                                right: rect.right - rect.width() * 0.45,
+                                right: mid - gap / 2.0,
                                 bottom: size.height,
                             },
                             &dim,
@@ -596,7 +600,7 @@ impl Renderer {
                             &clock_text,
                             &body,
                             &D2D_RECT_F {
-                                left: rect.left + rect.width() * 0.42,
+                                left: mid + gap / 2.0,
                                 top: 0.0,
                                 right: rect.right - BAR_SEGMENT_PAD_X,
                                 bottom: size.height,
@@ -699,7 +703,11 @@ impl Renderer {
                 }
             }
 
-            // Restore default alignment so other callers see the same state.
+            // Restore default alignment so other callers (paint_dock etc.) see
+            // the same state. Both `body` and `small` are shared COM objects --
+            // a clone shares the underlying IDWriteTextFormat, so leaving
+            // either in LEADING/TRAILING corrupts the dock's centered labels.
+            small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             body.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             present(surface)?;
         }
@@ -1046,6 +1054,10 @@ impl Renderer {
         unsafe {
             surface.context.BeginDraw();
             surface.context.Clear(Some(&color(0, 0, 0, 0.0)));
+            // Defensive: the text formats are shared COM objects that other
+            // paint methods (paint_top_bar) may have left in LEADING/TRAILING
+            // alignment. Reset to CENTER before drawing dock labels.
+            small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             let hide_offset = state.hide_progress.clamp(0.0, 1.0) * (icon_size + 24.0);
             let shell_bottom = size.height - 8.0 + hide_offset;
             let shell_width = geometry.content_width + 32.0;
