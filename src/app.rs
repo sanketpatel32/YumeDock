@@ -24,10 +24,11 @@ use windows::{
         Graphics::{
             Dwm::{
                 DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
-                DWM_TNP_VISIBLE, DWMSBT_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
+                DWM_TNP_VISIBLE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
                 DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-                DWMWCP_ROUND, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail,
-                DwmSetWindowAttribute, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
+                DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmQueryThumbnailSourceSize,
+                DwmRegisterThumbnail, DwmSetWindowAttribute, DwmUnregisterThumbnail,
+                DwmUpdateThumbnailProperties,
             },
             Gdi::{
                 BeginPaint, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, EndPaint,
@@ -41,7 +42,7 @@ use windows::{
         },
         UI::{
             Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-            Controls::WM_MOUSELEAVE,
+            Controls::{MARGINS, WM_MOUSELEAVE},
             HiDpi::{
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
                 SetProcessDpiAwarenessContext,
@@ -2808,20 +2809,21 @@ fn high_contrast_enabled() -> bool {
 }
 
 fn configure_window_backdrop(hwnd: HWND, rounded: bool, high_contrast: bool) {
-    // YumeDock's windows use WS_EX_NOREDIRECTIONBITMAP + DirectComposition and
-    // draw everything themselves with per-pixel alpha. We must explicitly tell
-    // DWM to paint NOTHING behind these windows: the default backdrop on Win11
-    // composites a dark surface under topmost popup windows, which shows up as
-    // an unwanted full-width dark band around the dock and top bar.
     if high_contrast {
         return;
     }
     let dark_mode = BOOL(1);
-    let backdrop = DWMSBT_NONE;
+    let backdrop = DWMSBT_TRANSIENTWINDOW;
     let corner = if rounded {
         DWMWCP_ROUND
     } else {
         DWMWCP_DONOTROUND
+    };
+    let margins = MARGINS {
+        cxLeftWidth: -1,
+        cxRightWidth: -1,
+        cyTopHeight: -1,
+        cyBottomHeight: -1,
     };
     unsafe {
         let _ = DwmSetWindowAttribute(
@@ -2842,6 +2844,7 @@ fn configure_window_backdrop(hwnd: HWND, rounded: bool, high_contrast: bool) {
             (&corner as *const windows::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE).cast(),
             std::mem::size_of_val(&corner) as u32,
         );
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
     }
 }
 
