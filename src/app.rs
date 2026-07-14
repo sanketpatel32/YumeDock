@@ -211,6 +211,11 @@ impl App {
             let top_height = self.config.top_bar.height;
             let dock_height = self.config.dock.height;
             let width = info.bounds.right - info.bounds.left;
+            let bottom_edge = if self.config.behavior.replace_taskbar {
+                info.bounds.bottom
+            } else {
+                info.work.bottom
+            };
             let item_count =
                 group_for_monitor(&self.config.pins, &self.windows, info.handle.0 as isize)
                     .len()
@@ -224,7 +229,7 @@ impl App {
             let top = create_window(info.bounds.left, info.bounds.top, width, top_height, true)?;
             let reserve = create_window(
                 info.bounds.left,
-                info.bounds.bottom - dock_height,
+                bottom_edge - dock_height,
                 width,
                 dock_height,
                 true,
@@ -236,7 +241,7 @@ impl App {
                 .max(dock_height as f32) as i32;
             let dock = create_window(
                 info.bounds.left + (width - dock_width) / 2,
-                info.bounds.bottom - dock_visual_height - 6,
+                bottom_edge - dock_visual_height - 8,
                 dock_width,
                 dock_visual_height,
                 false,
@@ -256,9 +261,9 @@ impl App {
                 };
                 let bottom_rect = RECT {
                     left: info.bounds.left,
-                    top: info.bounds.bottom - dock_height,
+                    top: bottom_edge - dock_height,
                     right: info.bounds.right,
-                    bottom: info.bounds.bottom,
+                    bottom: bottom_edge,
                 };
                 (
                     Some(AppBar::register(top, true, top_rect)?),
@@ -1202,15 +1207,48 @@ fn dock_label(item: &DockItem) -> String {
 
 fn dock_icon_path(item: &DockItem) -> Option<std::path::PathBuf> {
     match item {
-        DockItem::Application { pin: Some(pin), .. } | DockItem::Folder(pin) => {
-            Some(pin.path.clone())
-        }
+        DockItem::Application { pin: Some(pin), .. } => Some(preferred_pin_icon(pin)),
+        DockItem::Folder(pin) => Some(pin.path.clone()),
         DockItem::Application {
             identity: Some(identity),
             ..
         } => Some(identity.executable.clone()),
         DockItem::RecycleBin => Some(std::path::PathBuf::from(r"C:\$Recycle.Bin")),
         _ => None,
+    }
+}
+
+fn preferred_pin_icon(pin: &crate::config::PinConfig) -> std::path::PathBuf {
+    if pin.label.eq_ignore_ascii_case("File Explorer")
+        && let Some(windows) = std::env::var_os("WINDIR")
+    {
+        return std::path::PathBuf::from(windows).join("explorer.exe");
+    }
+    let Some(path) = pin.identity_path.as_ref() else {
+        return pin.path.clone();
+    };
+    let raw = path.to_string_lossy();
+    let expanded = if raw
+        .get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("%windir%"))
+    {
+        std::env::var_os("WINDIR")
+            .map(std::path::PathBuf::from)
+            .map(|root| {
+                root.join(
+                    raw.get(9..)
+                        .unwrap_or_default()
+                        .trim_start_matches(['\\', '/']),
+                )
+            })
+            .unwrap_or_else(|| path.clone())
+    } else {
+        path.clone()
+    };
+    if expanded.exists() {
+        expanded
+    } else {
+        pin.path.clone()
     }
 }
 
@@ -1260,8 +1298,18 @@ fn active_app_name(windows: &[WindowEntry]) -> String {
     windows
         .iter()
         .find(|w| w.hwnd == active)
-        .map(|w| w.identity.display_name.clone())
+        .map(|w| friendly_app_name(&w.identity.display_name))
         .unwrap_or_else(|| "Desktop".into())
+}
+
+fn friendly_app_name(process_name: &str) -> String {
+    match process_name.to_ascii_lowercase().as_str() {
+        "msedge" => "Microsoft Edge".into(),
+        "explorer" => "File Explorer".into(),
+        "steamwebhelper" => "Steam".into(),
+        "applicationframehost" => "Windows App".into(),
+        _ => process_name.to_string(),
+    }
 }
 
 fn current_clock(use_24: bool) -> String {
@@ -1294,3 +1342,15 @@ fn chrono_like_local_time() -> (i32, u32, u32, u32, u32) {
 }
 
 use std::os::windows::ffi::OsStrExt;
+
+#[cfg(test)]
+mod label_tests {
+    use super::friendly_app_name;
+
+    #[test]
+    fn replaces_raw_windows_process_names() {
+        assert_eq!(friendly_app_name("msedge"), "Microsoft Edge");
+        assert_eq!(friendly_app_name("explorer"), "File Explorer");
+        assert_eq!(friendly_app_name("YumePlayer"), "YumePlayer");
+    }
+}

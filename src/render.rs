@@ -128,7 +128,7 @@ impl Renderer {
                 let foreground =
                     target.CreateSolidColorBrush(&color(0xf5, 0xf7, 0xff, 1.0), None)?;
                 let accent = target.CreateSolidColorBrush(&color(0x70, 0xa8, 0xff, 1.0), None)?;
-                let panel = target.CreateSolidColorBrush(&color(0x12, 0x17, 0x22, 1.0), None)?;
+                let panel = target.CreateSolidColorBrush(&color(0x1b, 0x22, 0x30, 1.0), None)?;
                 self.surfaces.insert(
                     key,
                     Surface {
@@ -165,11 +165,14 @@ impl Renderer {
         let size = unsafe { surface.target.GetSize() };
         unsafe {
             surface.target.BeginDraw();
-            surface.target.Clear(Some(&color(0x08, 0x0c, 0x14, 1.0)));
+            surface.target.Clear(Some(&color(0x09, 0x0d, 0x15, 1.0)));
             let left_text: Vec<u16> = format!("  ◉   YumeDock     {left}")
                 .encode_utf16()
                 .collect();
             let right_text: Vec<u16> = format!("{right}   ").encode_utf16().collect();
+            body.SetTextAlignment(
+                windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_LEADING,
+            )?;
             surface.target.DrawText(
                 &left_text,
                 &body,
@@ -222,7 +225,7 @@ impl Renderer {
         let start = ((size.width - total) / 2.0).max(8.0) + 12.0;
         unsafe {
             surface.target.BeginDraw();
-            surface.target.Clear(Some(&color(0x08, 0x0c, 0x14, 1.0)));
+            surface.target.Clear(Some(&color(0x0b, 0x10, 0x19, 1.0)));
             surface.target.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
