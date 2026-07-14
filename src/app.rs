@@ -24,11 +24,9 @@ use windows::{
         Graphics::{
             Dwm::{
                 DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
-                DWM_TNP_VISIBLE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
-                DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-                DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmQueryThumbnailSourceSize,
-                DwmRegisterThumbnail, DwmSetWindowAttribute, DwmUnregisterThumbnail,
-                DwmUpdateThumbnailProperties,
+                DWM_TNP_VISIBLE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+                DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail,
+                DwmSetWindowAttribute, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
             },
             Gdi::{
                 BeginPaint, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, EndPaint,
@@ -42,7 +40,7 @@ use windows::{
         },
         UI::{
             Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
-            Controls::{MARGINS, WM_MOUSELEAVE},
+            Controls::WM_MOUSELEAVE,
             HiDpi::{
                 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
                 SetProcessDpiAwarenessContext,
@@ -2809,21 +2807,22 @@ fn high_contrast_enabled() -> bool {
 }
 
 fn configure_window_backdrop(hwnd: HWND, rounded: bool, high_contrast: bool) {
+    // YumeDock's windows use WS_EX_NOREDIRECTIONBITMAP + DirectComposition and
+    // draw everything themselves with per-pixel alpha. Applying DWM's system
+    // backdrop (Mica/transient) or extending the frame into the client area
+    // paints an *opaque* background underneath our transparent swap chain,
+    // which shows up as an unwanted gray rectangle around the dock and top bar.
+    // So we deliberately do NOT set DWMSBT_TRANSIENTWINDOW and do NOT call
+    // DwmExtendFrameIntoClientArea here. Only dark-mode + corner preference
+    // remain, neither of which paints a background.
     if high_contrast {
         return;
     }
     let dark_mode = BOOL(1);
-    let backdrop = DWMSBT_TRANSIENTWINDOW;
     let corner = if rounded {
         DWMWCP_ROUND
     } else {
         DWMWCP_DONOTROUND
-    };
-    let margins = MARGINS {
-        cxLeftWidth: -1,
-        cxRightWidth: -1,
-        cyTopHeight: -1,
-        cyBottomHeight: -1,
     };
     unsafe {
         let _ = DwmSetWindowAttribute(
@@ -2834,17 +2833,10 @@ fn configure_window_backdrop(hwnd: HWND, rounded: bool, high_contrast: bool) {
         );
         let _ = DwmSetWindowAttribute(
             hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            (&backdrop as *const windows::Win32::Graphics::Dwm::DWM_SYSTEMBACKDROP_TYPE).cast(),
-            std::mem::size_of_val(&backdrop) as u32,
-        );
-        let _ = DwmSetWindowAttribute(
-            hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             (&corner as *const windows::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE).cast(),
             std::mem::size_of_val(&corner) as u32,
         );
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
     }
 }
 
