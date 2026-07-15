@@ -1,17 +1,23 @@
 use anyhow::{Context, Result};
-use std::{collections::HashMap, os::windows::ffi::OsStrExt, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    os::windows::ffi::OsStrExt,
+    path::PathBuf,
+};
 use windows::{
     Win32::{
         Foundation::{HMODULE, HWND, RECT, SIZE},
         Graphics::{
             Direct2D::{
                 Common::{
+                    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
                     D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D1_FILL_MODE_WINDING,
-                    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+                    D2D1_PIXEL_FORMAT,
                 },
                 D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET,
                 D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR,
                 D2D1_ROUNDED_RECT, D2D1CreateDevice, ID2D1Bitmap1, ID2D1Brush, ID2D1DeviceContext,
                 ID2D1Factory, ID2D1Image, ID2D1PathGeometry, ID2D1SolidColorBrush,
             },
@@ -28,8 +34,8 @@ use windows::{
                 DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL,
                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
-                DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
-                DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+                DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWriteCreateFactory,
+                IDWriteFactory, IDWriteTextFormat,
             },
             Dxgi::{
                 Common::{
@@ -37,15 +43,19 @@ use windows::{
                 },
                 DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
                 DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice,
-                IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
+                IDXGIDevice1, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
             },
-            Gdi::{DeleteObject, HPALETTE},
+            Gdi::{
+                BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+                HPALETTE, ReleaseDC, SRCCOPY, SelectObject,
+            },
             Imaging::{
                 CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
-                WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
+                WICBitmapDitherTypeNone, WICBitmapIgnoreAlpha, WICBitmapPaletteTypeCustom,
                 WICBitmapUsePremultipliedAlpha,
             },
         },
+        Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow},
         System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile, STGM_READ},
         UI::{
             HiDpi::GetDpiForWindow,
@@ -56,7 +66,10 @@ use windows::{
                 SIID_APPLICATION, SIID_FOLDER, SIID_RECYCLER, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
                 ShellLink,
             },
-            WindowsAndMessaging::{DestroyIcon, GetClientRect, HICON, PrivateExtractIconsW},
+            WindowsAndMessaging::{
+                DestroyIcon, GetClientRect, GetWindowRect, HICON, PW_RENDERFULLCONTENT,
+                PrivateExtractIconsW,
+            },
         },
     },
     core::{Interface, PCWSTR, w},
@@ -215,10 +228,24 @@ struct Surface {
     indicator: ID2D1SolidColorBrush,
     panel: ID2D1SolidColorBrush,
     outline: ID2D1SolidColorBrush,
+    dock_outer_shadow: ID2D1SolidColorBrush,
+    dock_mid_shadow: ID2D1SolidColorBrush,
+    dock_near_shadow: ID2D1SolidColorBrush,
+    dock_top_highlight: ID2D1SolidColorBrush,
+    dock_inner_glow: ID2D1SolidColorBrush,
+    dock_bottom_edge: ID2D1SolidColorBrush,
+    dock_fallback: ID2D1SolidColorBrush,
+    dock_label_fill: ID2D1SolidColorBrush,
+    bar_pill_fill: ID2D1SolidColorBrush,
+    bar_dim: ID2D1SolidColorBrush,
+    bar_charge: ID2D1SolidColorBrush,
+    bar_low: ID2D1SolidColorBrush,
     icons: HashMap<PathBuf, ID2D1Bitmap1>,
+    failed_icons: HashSet<PathBuf>,
     recycle_icon: Option<ID2D1Bitmap1>,
     generic_app_icon: Option<ID2D1Bitmap1>,
     folder_icon: Option<ID2D1Bitmap1>,
+    genie_bitmap: Option<ID2D1Bitmap1>,
 }
 
 pub struct Renderer {
@@ -232,8 +259,12 @@ pub struct Renderer {
     bold: IDWriteTextFormat,
     small: IDWriteTextFormat,
     surfaces: HashMap<isize, Surface>,
+    genie_cache: HashMap<isize, ID2D1Bitmap1>,
     wic: IWICImagingFactory,
     high_contrast: bool,
+    /// Set when a device-removing HRESULT is observed. The next paint path
+    /// calls `handle_device_loss_if_needed()` and rebuilds the device.
+    device_lost: bool,
     /// Cached menu-bar vector icon geometries (local origin; translated on draw).
     geo_wifi: Option<ID2D1PathGeometry>,
     geo_speaker: Option<ID2D1PathGeometry>,
@@ -242,8 +273,97 @@ pub struct Renderer {
     geo_bolt: Option<ID2D1PathGeometry>,
 }
 
+struct DeviceParts {
+    d3d_device: ID3D11Device,
+    immediate_context: ID3D11DeviceContext,
+    d2d_device: windows::Win32::Graphics::Direct2D::ID2D1Device,
+    factory: ID2D1Factory,
+    dxgi_factory: IDXGIFactory2,
+    composition: IDCompositionDevice,
+}
+
 impl Renderer {
     pub fn new(high_contrast: bool) -> Result<Self> {
+        let text_factory: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
+        let wic: IWICImagingFactory = unsafe {
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?
+        };
+        let body = unsafe {
+            text_factory.CreateTextFormat(
+                w!("Segoe UI Variable Text"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                14.0,
+                w!("en-us"),
+            )?
+        };
+        unsafe {
+            body.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            body.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        }
+        let bold = unsafe {
+            text_factory.CreateTextFormat(
+                w!("Segoe UI Variable Text"),
+                None,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                14.0,
+                w!("en-us"),
+            )?
+        };
+        unsafe {
+            bold.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            bold.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        }
+        let small = unsafe {
+            text_factory.CreateTextFormat(
+                w!("Segoe UI Variable Text"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                12.0,
+                w!("en-us"),
+            )?
+        };
+        unsafe {
+            small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            small.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        }
+
+        let device = unsafe { Self::recreate_device()? };
+        Ok(Self {
+            _d3d_device: device.d3d_device,
+            _immediate_context: device.immediate_context,
+            d2d_device: device.d2d_device,
+            factory: device.factory,
+            dxgi_factory: device.dxgi_factory,
+            composition: device.composition,
+            body,
+            bold,
+            small,
+            surfaces: HashMap::new(),
+            genie_cache: HashMap::new(),
+            wic,
+            high_contrast,
+            device_lost: false,
+            geo_wifi: None,
+            geo_speaker: None,
+            geo_speaker_muted: None,
+            geo_battery: None,
+            geo_bolt: None,
+        })
+    }
+
+    /// Create (or recreate after device loss) the Direct3D + Direct2D + DXGI
+    /// + DirectComposition device stack. Returns the device-level handles;
+    /// text formats and the WIC factory are device-independent and stay in
+    /// `new`.
+    unsafe fn recreate_device() -> Result<DeviceParts> {
         unsafe {
             let mut d3d_device = None;
             let mut immediate_context = None;
@@ -262,66 +382,20 @@ impl Renderer {
             let immediate_context =
                 immediate_context.context("Direct3D context was not created")?;
             let dxgi_device: IDXGIDevice = d3d_device.cast()?;
+            let dxgi_device1: IDXGIDevice1 = dxgi_device.cast()?;
+            dxgi_device1.SetMaximumFrameLatency(1)?;
             let adapter = dxgi_device.GetAdapter()?;
             let dxgi_factory: IDXGIFactory2 = adapter.GetParent()?;
             let d2d_device = D2D1CreateDevice(&dxgi_device, None)?;
             let factory: ID2D1Factory = d2d_device.GetFactory()?;
             let composition: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
-
-            let text_factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let wic: IWICImagingFactory =
-                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
-            let body = text_factory.CreateTextFormat(
-                w!("Segoe UI Variable Text"),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                14.0,
-                w!("en-us"),
-            )?;
-            body.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            body.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            let bold = text_factory.CreateTextFormat(
-                w!("Segoe UI Variable Text"),
-                None,
-                DWRITE_FONT_WEIGHT_BOLD,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                14.0,
-                w!("en-us"),
-            )?;
-            bold.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
-            bold.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            let small = text_factory.CreateTextFormat(
-                w!("Segoe UI Variable Text"),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                12.0,
-                w!("en-us"),
-            )?;
-            small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            small.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            Ok(Self {
-                _d3d_device: d3d_device,
-                _immediate_context: immediate_context,
+            Ok(DeviceParts {
+                d3d_device,
+                immediate_context,
                 d2d_device,
                 factory,
                 dxgi_factory,
                 composition,
-                body,
-                bold,
-                small,
-                surfaces: HashMap::new(),
-                wic,
-                high_contrast,
-                geo_wifi: None,
-                geo_speaker: None,
-                geo_speaker_muted: None,
-                geo_battery: None,
-                geo_bolt: None,
             })
         }
     }
@@ -422,6 +496,30 @@ impl Renderer {
         };
         let outline =
             unsafe { context.CreateSolidColorBrush(&color(0xff, 0xff, 0xff, 0.18), None)? };
+        let dock_outer_shadow =
+            unsafe { context.CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.10), None)? };
+        let dock_mid_shadow =
+            unsafe { context.CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.14), None)? };
+        let dock_near_shadow =
+            unsafe { context.CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.18), None)? };
+        let dock_top_highlight =
+            unsafe { context.CreateSolidColorBrush(&color(0xff, 0xff, 0xff, 0.20), None)? };
+        let dock_inner_glow =
+            unsafe { context.CreateSolidColorBrush(&color(0xff, 0xff, 0xff, 0.06), None)? };
+        let dock_bottom_edge =
+            unsafe { context.CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.12), None)? };
+        let dock_fallback =
+            unsafe { context.CreateSolidColorBrush(&color(0x46, 0x4d, 0x59, 0.78), None)? };
+        let dock_label_fill =
+            unsafe { context.CreateSolidColorBrush(&color(0x1a, 0x1e, 0x26, 0.94), None)? };
+        let bar_pill_fill =
+            unsafe { context.CreateSolidColorBrush(&color(0xf5, 0xf7, 0xfa, 0.14), None)? };
+        let bar_dim =
+            unsafe { context.CreateSolidColorBrush(&color(0xf5, 0xf7, 0xfa, 0.45), None)? };
+        let bar_charge =
+            unsafe { context.CreateSolidColorBrush(&color(0x6c, 0xe0, 0x8a, 1.0), None)? };
+        let bar_low =
+            unsafe { context.CreateSolidColorBrush(&color(0xff, 0x7a, 0x6b, 1.0), None)? };
         Ok(Surface {
             context,
             swap_chain,
@@ -432,10 +530,24 @@ impl Renderer {
             indicator,
             panel,
             outline,
+            dock_outer_shadow,
+            dock_mid_shadow,
+            dock_near_shadow,
+            dock_top_highlight,
+            dock_inner_glow,
+            dock_bottom_edge,
+            dock_fallback,
+            dock_label_fill,
+            bar_pill_fill,
+            bar_dim,
+            bar_charge,
+            bar_low,
             icons: HashMap::new(),
+            failed_icons: HashSet::new(),
             recycle_icon: None,
             generic_app_icon: None,
             folder_icon: None,
+            genie_bitmap: None,
         })
     }
 
@@ -462,15 +574,125 @@ impl Renderer {
                 surface.context.SetDpi(dpi, dpi);
                 surface.target_bitmap = bitmap;
                 surface.icons.clear();
+                surface.failed_icons.clear();
                 surface.recycle_icon = None;
                 surface.generic_app_icon = None;
                 surface.folder_icon = None;
+                surface.genie_bitmap = None;
             }
         }
     }
 
     pub fn forget(&mut self, hwnd: HWND) {
         self.surfaces.remove(&(hwnd.0 as isize));
+    }
+
+    pub fn prepare_genie_snapshot(
+        &mut self,
+        overlay: HWND,
+        source: HWND,
+        width: i32,
+        height: i32,
+        prefer_cached: bool,
+    ) -> Result<()> {
+        let key = source.0 as isize;
+        let cached = prefer_cached
+            .then(|| self.genie_cache.get(&key).cloned())
+            .flatten();
+        let wic = self.wic.clone();
+        let bitmap = {
+            let surface = self.surface(overlay)?;
+            cached.or_else(|| {
+                capture_window_bitmap(
+                    &wic,
+                    &surface.context,
+                    source,
+                    width,
+                    height,
+                    !prefer_cached,
+                )
+            })
+        }
+        .context("window snapshot could not be captured")?;
+
+        if !prefer_cached {
+            if self.genie_cache.len() >= 16 && !self.genie_cache.contains_key(&key) {
+                self.genie_cache.clear();
+            }
+            self.genie_cache.insert(key, bitmap.clone());
+        }
+        self.surface(overlay)?.genie_bitmap = Some(bitmap);
+        Ok(())
+    }
+
+    pub fn cache_genie_snapshot(
+        &mut self,
+        surface_hwnd: HWND,
+        source: HWND,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        let wic = self.wic.clone();
+        let bitmap = {
+            let Ok(surface) = self.surface(surface_hwnd) else {
+                return false;
+            };
+            capture_window_bitmap(&wic, &surface.context, source, width, height, true)
+        };
+        let Some(bitmap) = bitmap else {
+            return false;
+        };
+        let key = source.0 as isize;
+        if self.genie_cache.len() >= 16 && !self.genie_cache.contains_key(&key) {
+            self.genie_cache.clear();
+        }
+        self.genie_cache.insert(key, bitmap);
+        true
+    }
+
+    pub fn paint_genie(&mut self, hwnd: HWND, destinations: &[RECT], opacity: f32) -> Result<()> {
+        let surface = self.surface(hwnd)?;
+        let bitmap = surface
+            .genie_bitmap
+            .as_ref()
+            .context("genie snapshot is missing")?;
+        let bitmap_size = unsafe { bitmap.GetPixelSize() };
+        let scale = unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 };
+        let slice_count = destinations.len().max(1) as f32;
+
+        unsafe {
+            surface.context.BeginDraw();
+            surface.context.Clear(Some(&color(0, 0, 0, 0.0)));
+            for (index, destination) in destinations.iter().enumerate() {
+                if destination.right <= destination.left || destination.bottom <= destination.top {
+                    continue;
+                }
+                let top = bitmap_size.height as f32 * index as f32 / slice_count;
+                let bottom = bitmap_size.height as f32 * (index + 1) as f32 / slice_count;
+                let source = D2D_RECT_F {
+                    left: 0.0,
+                    top,
+                    right: bitmap_size.width as f32,
+                    bottom,
+                };
+                let destination = D2D_RECT_F {
+                    left: destination.left as f32 / scale,
+                    top: destination.top as f32 / scale,
+                    right: destination.right as f32 / scale,
+                    bottom: destination.bottom as f32 / scale,
+                };
+                surface.context.DrawBitmap(
+                    bitmap,
+                    Some(&destination),
+                    opacity.clamp(0.0, 1.0),
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    Some(&source),
+                    None,
+                );
+            }
+            present_immediate(surface)?;
+        }
+        Ok(())
     }
 
     pub fn paint_top_bar(
@@ -495,13 +717,7 @@ impl Renderer {
         let geo_bolt = self.geo_bolt.clone();
         let surface = self.surface(hwnd)?;
         let size = unsafe { surface.context.GetSize() };
-        let geometry = top_bar_geometry(
-            size.width,
-            size.height,
-            app_name,
-            status,
-            flags,
-        );
+        let geometry = top_bar_geometry(size.width, size.height, app_name, status, flags);
         unsafe {
             surface.context.BeginDraw();
             // Bar backdrop: slightly deeper than the dock for separation.
@@ -512,18 +728,10 @@ impl Renderer {
                 if high_contrast { 1.0 } else { 0.48 },
             )));
 
-            let pill_fill = surface
-                .context
-                .CreateSolidColorBrush(&color(0xf5, 0xf7, 0xfa, 0.14), None)?;
-            let dim = surface
-                .context
-                .CreateSolidColorBrush(&color(0xf5, 0xf7, 0xfa, 0.45), None)?;
-            let charge = surface
-                .context
-                .CreateSolidColorBrush(&color(0x6c, 0xe0, 0x8a, 1.0), None)?;
-            let low = surface
-                .context
-                .CreateSolidColorBrush(&color(0xff, 0x7a, 0x6b, 1.0), None)?;
+            let pill_fill = surface.bar_pill_fill.clone();
+            let dim = surface.bar_dim.clone();
+            let charge = surface.bar_charge.clone();
+            let low = surface.bar_low.clone();
 
             // --- Left cluster: neutral mark + bold app name. ---
             let mark_cx = BAR_LEFT_MARK_OFFSET + BAR_LEFT_MARK_RADIUS;
@@ -615,7 +823,18 @@ impl Renderer {
                             fill_pill(&surface.context, rect, &pill_fill);
                         }
                         if let Some(geo) = geo_wifi.as_ref() {
-                            draw_icon(&surface.context, geo, rect, 16.0, 18.0, if status.network_online { &surface.foreground } else { &dim });
+                            draw_icon(
+                                &surface.context,
+                                geo,
+                                rect,
+                                16.0,
+                                18.0,
+                                if status.network_online {
+                                    &surface.foreground
+                                } else {
+                                    &dim
+                                },
+                            );
                         }
                         if !status.network_online {
                             // Strike-through line over the icon: shape conveys "off",
@@ -636,7 +855,11 @@ impl Renderer {
                             fill_pill(&surface.context, rect, &pill_fill);
                         }
                         let muted = status.muted;
-                        let geo = if muted { geo_speaker_muted.as_ref() } else { geo_speaker.as_ref() };
+                        let geo = if muted {
+                            geo_speaker_muted.as_ref()
+                        } else {
+                            geo_speaker.as_ref()
+                        };
                         if let Some(geo) = geo {
                             let brush = if muted { &dim } else { &surface.foreground };
                             draw_icon(&surface.context, geo, rect, 14.0, 14.0, brush);
@@ -646,7 +869,9 @@ impl Renderer {
                         if hover == Some(TopBarSegment::Battery) {
                             fill_pill(&surface.context, rect, &pill_fill);
                         }
-                        let Some(percent) = status.battery_percent else { continue };
+                        let Some(percent) = status.battery_percent else {
+                            continue;
+                        };
                         // Outline + nub rendered via the cached geometry (translated),
                         // then a proportional fill rect for the charge level.
                         let cell_w = 22.0;
@@ -675,7 +900,11 @@ impl Renderer {
                         );
                         let _ = geo_battery.as_ref(); // outline geometry reserved for future stroke
                         surface.context.DrawRoundedRectangle(
-                            &D2D1_ROUNDED_RECT { rect: outline, radiusX: 3.0, radiusY: 3.0 },
+                            &D2D1_ROUNDED_RECT {
+                                rect: outline,
+                                radiusX: 3.0,
+                                radiusY: 3.0,
+                            },
                             &surface.foreground,
                             1.2,
                             None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
@@ -696,7 +925,14 @@ impl Renderer {
                         );
                         if status.charging {
                             if let Some(bolt) = geo_bolt.as_ref() {
-                                draw_icon(&surface.context, bolt, rect, 9.0, 14.0, &surface.foreground);
+                                draw_icon(
+                                    &surface.context,
+                                    bolt,
+                                    rect,
+                                    9.0,
+                                    14.0,
+                                    &surface.foreground,
+                                );
                             }
                         }
                     }
@@ -1072,15 +1308,9 @@ impl Renderer {
                 radiusY: 18.0,
             };
             // Three-layer shadow for a soft, lifted macOS-style appearance.
-            let outer_shadow = surface
-                .context
-                .CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.10), None)?;
-            let mid_shadow = surface
-                .context
-                .CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.14), None)?;
-            let near_shadow = surface
-                .context
-                .CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.18), None)?;
+            let outer_shadow = surface.dock_outer_shadow.clone();
+            let mid_shadow = surface.dock_mid_shadow.clone();
+            let near_shadow = surface.dock_near_shadow.clone();
             // Outermost diffuse shadow
             surface.context.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
@@ -1128,9 +1358,7 @@ impl Renderer {
                 .context
                 .DrawRoundedRectangle(&shell, &surface.outline, 1.0, None);
             // Subtle glass-edge highlight along the top of the dock.
-            let top_highlight = surface
-                .context
-                .CreateSolidColorBrush(&color(0xff, 0xff, 0xff, 0.20), None)?;
+            let top_highlight = surface.dock_top_highlight.clone();
             surface.context.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
@@ -1145,9 +1373,7 @@ impl Renderer {
                 &top_highlight,
             );
             // Inner glow along the top inside of the dock for depth.
-            let inner_glow = surface
-                .context
-                .CreateSolidColorBrush(&color(0xff, 0xff, 0xff, 0.06), None)?;
+            let inner_glow = surface.dock_inner_glow.clone();
             surface.context.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
@@ -1162,9 +1388,7 @@ impl Renderer {
                 &inner_glow,
             );
             // Subtle bottom edge for grounding.
-            let bottom_edge = surface
-                .context
-                .CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.12), None)?;
+            let bottom_edge = surface.dock_bottom_edge.clone();
             surface.context.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
@@ -1243,12 +1467,19 @@ impl Renderer {
                         .iter()
                         .chain(item.fallback_icon_path.iter())
                         .find_map(|path| {
-                            if !surface.icons.contains_key(path)
-                                && let Some(bitmap) = load_icon_bitmap(&wic, &surface.context, path)
-                            {
-                                surface.icons.insert(path.clone(), bitmap);
+                            if surface.failed_icons.contains(path) {
+                                return None;
                             }
-                            surface.icons.get(path).cloned()
+                            if let Some(bitmap) = surface.icons.get(path) {
+                                return Some(bitmap.clone());
+                            }
+                            if let Some(bitmap) = load_icon_bitmap(&wic, &surface.context, path) {
+                                surface.icons.insert(path.clone(), bitmap.clone());
+                                Some(bitmap)
+                            } else {
+                                surface.failed_icons.insert(path.clone());
+                                None
+                            }
                         })
                 };
                 if bitmap.is_none() && item.folder {
@@ -1281,16 +1512,13 @@ impl Renderer {
                         None,
                     );
                 } else {
-                    let fallback = surface
-                        .context
-                        .CreateSolidColorBrush(&color(0x46, 0x4d, 0x59, 0.78), None)?;
                     surface.context.FillRoundedRectangle(
                         &D2D1_ROUNDED_RECT {
                             rect,
                             radiusX: draw_side * 0.22,
                             radiusY: draw_side * 0.22,
                         },
-                        &fallback,
+                        &surface.dock_fallback,
                     );
                 }
                 if item.running {
@@ -1325,9 +1553,7 @@ impl Renderer {
                     radiusX: 7.0,
                     radiusY: 7.0,
                 };
-                let bubble_fill = surface
-                    .context
-                    .CreateSolidColorBrush(&color(0x1a, 0x1e, 0x26, 0.94), None)?;
+                let bubble_fill = surface.dock_label_fill.clone();
                 surface.context.FillRoundedRectangle(&bubble, &bubble_fill);
                 surface
                     .context
@@ -1475,6 +1701,32 @@ pub fn dock_hit_test(
         .map(|(index, _)| index)
 }
 
+/// Return the Dock icon bounds in Dock-client DIPs. This mirrors the exact
+/// geometry used by `paint_dock`, so launch animations start at the icon the
+/// user actually clicked.
+pub fn dock_icon_rect(
+    width: f32,
+    height: f32,
+    count: usize,
+    icon_size: f32,
+    hover_x: Option<f32>,
+    magnification: f32,
+    separator: Option<usize>,
+    hide_progress: f32,
+    index: usize,
+) -> Option<D2D_RECT_F> {
+    let geometry = dock_geometry(width, count, icon_size, hover_x, magnification, separator);
+    let icon = *geometry.icons.get(index)?;
+    let shell_bottom = height - 8.0 + hide_progress.clamp(0.0, 1.0) * (icon_size + 24.0);
+    let bottom = shell_bottom - 9.0 - (icon.side - icon_size) * 0.16;
+    Some(D2D_RECT_F {
+        left: icon.left,
+        top: bottom - icon.side,
+        right: icon.left + icon.side,
+        bottom,
+    })
+}
+
 fn dock_geometry(
     width: f32,
     count: usize,
@@ -1554,6 +1806,17 @@ unsafe fn present(surface: &Surface) -> Result<()> {
     Ok(())
 }
 
+/// Submit animation frames without waiting inside the UI thread. DWM still composites
+/// the DirectComposition surface on its own vsync, but the timer remains free to build
+/// the next frame instead of alternating between a timer wait and a Present wait.
+unsafe fn present_immediate(surface: &Surface) -> Result<()> {
+    unsafe {
+        surface.context.EndDraw(None, None)?;
+        surface.swap_chain.Present(0, DXGI_PRESENT(0)).ok()?;
+    }
+    Ok(())
+}
+
 fn load_icon_bitmap(
     wic: &IWICImagingFactory,
     target: &ID2D1DeviceContext,
@@ -1601,6 +1864,79 @@ fn shell_image_bitmap(
             .ok()?;
         let source = wic
             .CreateBitmapFromHBITMAP(bitmap, HPALETTE::default(), WICBitmapUsePremultipliedAlpha)
+            .ok();
+        let _ = DeleteObject(bitmap.into());
+        let source = source?;
+        let converter = wic.CreateFormatConverter().ok()?;
+        converter
+            .Initialize(
+                &source,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None::<&windows::Win32::Graphics::Imaging::IWICPalette>,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )
+            .ok()?;
+        target.CreateBitmapFromWicBitmap(&converter, None).ok()
+    }
+}
+
+fn capture_window_bitmap(
+    wic: &IWICImagingFactory,
+    target: &ID2D1DeviceContext,
+    hwnd: HWND,
+    width: i32,
+    height: i32,
+    prefer_screen: bool,
+) -> Option<ID2D1Bitmap1> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    unsafe {
+        let screen_dc = GetDC(None);
+        if screen_dc.0.is_null() {
+            return None;
+        }
+        let memory_dc = CreateCompatibleDC(Some(screen_dc));
+        if memory_dc.0.is_null() {
+            let _ = ReleaseDC(None, screen_dc);
+            return None;
+        }
+        let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+        if bitmap.0.is_null() {
+            let _ = DeleteDC(memory_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return None;
+        }
+        let previous = SelectObject(memory_dc, bitmap.into());
+        let mut window_rect = RECT::default();
+        let copied = prefer_screen
+            && GetWindowRect(hwnd, &mut window_rect).is_ok()
+            && BitBlt(
+                memory_dc,
+                0,
+                0,
+                width,
+                height,
+                Some(screen_dc),
+                window_rect.left,
+                window_rect.top,
+                SRCCOPY,
+            )
+            .is_ok();
+        let copied = copied
+            || PrintWindow(hwnd, memory_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool();
+        let _ = SelectObject(memory_dc, previous);
+        let _ = DeleteDC(memory_dc);
+        let _ = ReleaseDC(None, screen_dc);
+        if !copied {
+            let _ = DeleteObject(bitmap.into());
+            return None;
+        }
+
+        let source = wic
+            .CreateBitmapFromHBITMAP(bitmap, HPALETTE::default(), WICBitmapIgnoreAlpha)
             .ok();
         let _ = DeleteObject(bitmap.into());
         let source = source?;
@@ -1809,11 +2145,7 @@ impl RectExt for D2D_RECT_F {
 }
 
 /// Draw the rounded hover "pill" behind a segment, inset vertically.
-unsafe fn fill_pill(
-    context: &ID2D1DeviceContext,
-    rect: &D2D_RECT_F,
-    brush: &ID2D1SolidColorBrush,
-) {
+unsafe fn fill_pill(context: &ID2D1DeviceContext, rect: &D2D_RECT_F, brush: &ID2D1SolidColorBrush) {
     unsafe {
         context.FillRoundedRectangle(
             &D2D1_ROUNDED_RECT {
@@ -1956,12 +2288,7 @@ fn speaker_muted_figure() -> LocalFigure {
 fn battery_outline_figure() -> LocalFigure {
     LocalFigure {
         start: (1.5, 3.5),
-        lines: vec![
-            (1.5, 8.5),
-            (19.5, 8.5),
-            (19.5, 3.5),
-            (1.5, 3.5),
-        ],
+        lines: vec![(1.5, 8.5), (19.5, 8.5), (19.5, 3.5), (1.5, 3.5)],
     }
 }
 
@@ -1984,8 +2311,8 @@ fn bolt_figure() -> LocalFigure {
 #[cfg(test)]
 mod tests {
     use super::{
-        dock_geometry, smoothstep, top_bar_geometry, top_bar_hit_test, RectExt, TopBarSegment,
-        TopBarSegmentFlags, TopBarStatus,
+        RectExt, TopBarSegment, TopBarSegmentFlags, TopBarStatus, dock_geometry, smoothstep,
+        top_bar_geometry, top_bar_hit_test,
     };
 
     fn full_status() -> TopBarStatus {
@@ -2030,7 +2357,9 @@ mod tests {
     #[test]
     fn clock_segment_is_flush_with_right_edge() {
         let geo = top_bar_geometry(1920.0, 32.0, "Edge", full_status(), all_on());
-        let clock = geo.find(TopBarSegment::Clock).expect("clock segment exists");
+        let clock = geo
+            .find(TopBarSegment::Clock)
+            .expect("clock segment exists");
         assert!(
             (clock.right - 1920.0).abs() < f32::EPSILON,
             "clock right edge {} should be flush with bar width",
