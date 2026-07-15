@@ -35,10 +35,10 @@ pub fn write(level: &str, message: &str) {
         return;
     };
     // Rotate if too large. Best-effort: ignore errors.
-    if let Ok(meta) = fs::metadata(&path) {
-        if meta.len() > MAX_BYTES {
-            let _ = fs::rename(&path, path.with_extension("log.1"));
-        }
+    if let Ok(meta) = fs::metadata(&path)
+        && meta.len() > MAX_BYTES
+    {
+        let _ = fs::rename(&path, path.with_extension("log.1"));
     }
     let line = format!("[{}] {}\n", level, message);
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {

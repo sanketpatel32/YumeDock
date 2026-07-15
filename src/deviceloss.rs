@@ -33,7 +33,7 @@ impl DeviceLossPolicy {
         // DXGI_ERROR_DEVICE_REMOVED  0x887A0005
         // DXGI_ERROR_DEVICE_HUNG     0x887A0006
         // DXGI_ERROR_DEVICE_RESET    0x887A0007
-        if matches!(hr, 0x887A0005 | 0x887A0006 | 0x887A0007) {
+        if matches!(hr, 0x887A0005..=0x887A0007) {
             return PresentAction::RecreateAll;
         }
         // DXGI_STATUS_OCCLUDED 0x087A0001 — minimised / occluded; just skip.
