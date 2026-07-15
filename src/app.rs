@@ -109,6 +109,7 @@ const CMD_TOGGLE_PIN: usize = 202;
 const CMD_MINIMIZE_ITEM: usize = 203;
 const CMD_CLOSE_ITEM: usize = 204;
 const CMD_EMPTY_RECYCLE: usize = 205;
+const CMD_DEBUG_POPOVER: usize = 300;
 pub const WM_REFRESH: u32 = WM_APP + 1;
 const WM_REBUILD_MONITORS: u32 = WM_APP + 2;
 const WM_FOREGROUND_CHANGED: u32 = WM_APP + 3;
@@ -135,6 +136,7 @@ enum WindowKind {
     Preview,
     FolderStack,
     LaunchOverlay,
+    DebugPopover,
 }
 
 struct Preview {
@@ -156,6 +158,14 @@ struct FolderStack {
     hover: Option<usize>,
     footer_hover: bool,
     pointer_x: f32,
+}
+
+/// A single topbar popover window. Only one is ever open at a time
+/// (`App::active_popover`), matching the macOS menu-bar invariant.
+struct Popover {
+    hwnd: HWND,
+    /// The top-bar window that owns this popover (anchor + dismiss owner).
+    owner: HWND,
 }
 
 struct LaunchBounce {
@@ -243,6 +253,7 @@ pub struct App {
     high_contrast: bool,
     last_genie_snapshot: Option<(isize, Instant)>,
     last_clock: String,
+    active_popover: Option<Popover>,
 }
 
 impl App {
@@ -294,6 +305,7 @@ impl App {
             high_contrast,
             last_genie_snapshot: None,
             last_clock,
+            active_popover: None,
         };
         if app.config.behavior.replace_taskbar {
             app.taskbar.hide();
@@ -2821,6 +2833,77 @@ impl App {
                 }
             }
         }
+    }
+
+    fn close_popover(&mut self) {
+        if let Some(popover) = self.active_popover.take() {
+            self.kinds.remove(&(popover.hwnd.0 as isize));
+            self.renderer.forget(popover.hwnd);
+            unsafe {
+                let _ = DestroyWindow(popover.hwnd);
+            }
+        }
+    }
+
+    /// Create a popover window anchored under `cursor_x` on the given top
+    /// window. Returns the new hwnd. The caller registers the specific
+    /// `WindowKind`. Reuses the folder_stack anchor math.
+    fn open_popover(&mut self, owner: HWND, kind: WindowKind, width: i32, height: i32) {
+        self.close_popover();
+        let scale = self
+            .monitor_for(owner)
+            .map(|shell| shell.scale)
+            .unwrap_or_else(|| window_scale(owner));
+        let owner_rect = {
+            let mut r = RECT::default();
+            // If we can't read the owner rect, bail out (can't anchor).
+            if unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetWindowRect(owner, &mut r).is_err()
+            } {
+                crate::yume_warn!("popover: could not read owner window rect");
+                return;
+            }
+            r
+        };
+        let cursor = self
+            .cursor_x
+            .get(&(owner.0 as isize))
+            .copied()
+            .unwrap_or((owner_rect.right - owner_rect.left) as f32 / 2.0);
+        let bounds = self
+            .monitor_for(owner)
+            .map(|shell| shell.info.bounds)
+            .unwrap_or(owner_rect);
+        let margin = scale_i32(8, scale);
+        let anchor_x = owner_rect.left + (cursor * scale).round() as i32;
+        let min_x = bounds.left + margin;
+        let max_x = (bounds.right - scale_i32(width, scale) - margin).max(min_x);
+        let x = (anchor_x - scale_i32(width, scale) / 2).clamp(min_x, max_x);
+        let y = owner_rect.bottom;
+        let w = scale_i32(width, scale);
+        let h = scale_i32(height, scale);
+        let Ok(hwnd) = create_window(x, y, w, h, false) else {
+            crate::yume_warn!("popover window creation failed");
+            return;
+        };
+        configure_window_backdrop(hwnd, true, self.high_contrast);
+        self.kinds.insert(hwnd.0 as isize, kind);
+        self.active_popover = Some(Popover { hwnd, owner });
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    /// Open the Phase-1c debug popover — a labelled rectangle that proves the
+    /// popover system works end to end (create, render, dismiss). Phases 2–4
+    /// replace this with real popovers.
+    fn toggle_debug_popover(&mut self, owner: HWND) {
+        if self.active_popover.is_some() {
+            self.close_popover();
+            return;
+        }
+        self.open_popover(owner, WindowKind::DebugPopover, 220, 120);
     }
 
     fn folder_stack_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
