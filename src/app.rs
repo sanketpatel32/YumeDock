@@ -174,8 +174,6 @@ struct FolderStack {
 /// `scroll` is the index of the first visible row; `hover` is the currently
 /// highlighted target (action index or visible app index).
 struct LauncherState {
-    hwnd: HWND,
-    owner: HWND,
     /// (label, .lnk path) for each Start Menu app, alphabetical.
     apps: Vec<(String, std::path::PathBuf)>,
     /// Index of the first visible app row.
@@ -3057,8 +3055,6 @@ impl App {
         );
         if let Some(popover) = &self.active_popover {
             self.launcher = Some(LauncherState {
-                hwnd: popover.hwnd,
-                owner: popover.owner,
                 apps,
                 scroll: 0,
                 hover: None,
@@ -3580,7 +3576,7 @@ fn enumerate_start_menu() -> Vec<(String, std::path::PathBuf)> {
     for dir in dirs.into_iter().flatten() {
         collect_lnk(&dir, &mut entries);
     }
-    entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    entries.sort_by_key(|a| a.0.to_lowercase());
     entries.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
     entries.truncate(64);
     entries
