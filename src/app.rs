@@ -2846,8 +2846,8 @@ impl App {
     }
 
     /// Create a popover window anchored under `cursor_x` on the given top
-    /// window. Returns the new hwnd. The caller registers the specific
-    /// `WindowKind`. Reuses the folder_stack anchor math.
+    /// window. The caller passes the specific `WindowKind` to register.
+    /// Reuses the folder_stack anchor math.
     fn open_popover(&mut self, owner: HWND, kind: WindowKind, width: i32, height: i32) {
         self.close_popover();
         let scale = self
@@ -2869,7 +2869,7 @@ impl App {
             .cursor_x
             .get(&(owner.0 as isize))
             .copied()
-            .unwrap_or((owner_rect.right - owner_rect.left) as f32 / 2.0);
+            .unwrap_or((owner_rect.right - owner_rect.left) as f32 / (2.0 * scale));
         let bounds = self
             .monitor_for(owner)
             .map(|shell| shell.info.bounds)
