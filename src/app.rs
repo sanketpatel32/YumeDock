@@ -242,6 +242,7 @@ pub struct App {
     monitor_rebuild_pending: bool,
     high_contrast: bool,
     last_genie_snapshot: Option<(isize, Instant)>,
+    last_clock: String,
 }
 
 impl App {
@@ -261,6 +262,7 @@ impl App {
         let high_contrast = high_contrast_enabled();
         let renderer = Renderer::new(high_contrast)?;
         let system_status = status::read_status();
+        let last_clock = current_clock(config.top_bar.use_24_hour_clock);
         let mut app = Self {
             config,
             renderer,
@@ -291,6 +293,7 @@ impl App {
             monitor_rebuild_pending: false,
             high_contrast,
             last_genie_snapshot: None,
+            last_clock,
         };
         if app.config.behavior.replace_taskbar {
             app.taskbar.hide();
@@ -475,7 +478,7 @@ impl App {
                 let _ = ShowWindow(reserve, SW_HIDE);
                 if self.shells.len() == 1 {
                     SetTimer(Some(top), 1, 5000, None);
-                    SetTimer(Some(top), 12, 250, None);
+                    SetTimer(Some(top), 12, 1000, None);
                 }
                 if self.config.dock.auto_hide {
                     SetTimer(Some(dock), 8, 1000, None);
@@ -660,7 +663,15 @@ impl App {
     }
 
     fn refresh_system_status(&mut self) {
-        self.system_status = status::read_status();
+        let next = status::read_status();
+        let clock = current_clock(self.config.top_bar.use_24_hour_clock);
+        let status_changed = next != self.system_status;
+        let clock_changed = clock != self.last_clock;
+        self.system_status = next;
+        self.last_clock = clock;
+        if !status_changed && !clock_changed {
+            return;
+        }
         for shell in &self.shells {
             unsafe {
                 let _ = InvalidateRect(Some(shell.top), None, false);
@@ -680,6 +691,19 @@ impl App {
     fn cache_foreground_for_genie(&mut self) {
         // A full-window capture on this UI thread would steal a frame from the active transition.
         if self.window_open_animation.is_some() {
+            return;
+        }
+        // Nothing to cache for transitions when the dock is fully hidden and
+        // nothing is animating — skip the foreground probing entirely.
+        if self.config.dock.auto_hide
+            && self.window_open_animation.is_none()
+            && self.launch_bounce.is_empty()
+            && self.shells.iter().all(|shell| {
+                self.auto_hide
+                    .get(&(shell.dock.0 as isize))
+                    .is_some_and(|state| state.target >= 1.0 && state.progress >= 0.999)
+            })
+        {
             return;
         }
         let source = unsafe { GetForegroundWindow() };

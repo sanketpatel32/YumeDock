@@ -1,6 +1,6 @@
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SystemStatus {
     pub battery_percent: Option<u8>,
     pub charging: bool,
