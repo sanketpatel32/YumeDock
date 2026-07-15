@@ -504,6 +504,7 @@ impl App {
     fn destroy_monitor_shells(&mut self) {
         self.close_window_open_animation(false);
         self.pending_window_open = None;
+        self.close_popover();
         self.close_folder_stack();
         self.close_preview();
         self.preview_candidate = None;
