@@ -1236,6 +1236,108 @@ impl Renderer {
         Ok(())
     }
 
+    /// Render the launcher popover. `action_labels` are the quick-action row
+    /// labels; `apps` is the visible window of (label, icon path) tuples
+    /// (already scroll-shifted by the caller); `hover` highlights one target.
+    pub fn paint_launcher(
+        &mut self,
+        hwnd: HWND,
+        action_labels: &[&str],
+        apps: &[(String, std::path::PathBuf)],
+        hover: Option<LauncherHit>,
+    ) -> Result<()> {
+        if self.handle_device_loss_if_needed() {
+            return Ok(());
+        }
+        let body = self.body.clone();
+        let small = self.small.clone();
+        let wic = self.wic.clone();
+        let surface = self.surface(hwnd)?;
+        let size = unsafe { surface.context.GetSize() };
+        let layout = launcher_geometry(size.width, size.height, action_labels.len(), apps.len());
+        unsafe {
+            surface.context.BeginDraw();
+            surface.context.Clear(Some(&color(0x0c, 0x0f, 0x14, 0.92)));
+
+            // Action rows.
+            for (i, label) in action_labels.iter().enumerate() {
+                if let Some(rect) = layout.actions.get(i) {
+                    if hover == Some(LauncherHit::Action(i)) {
+                        surface.context.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT { rect: *rect, radiusX: 6.0, radiusY: 6.0 },
+                            &surface.bar_pill_fill,
+                        );
+                    }
+                    let text: Vec<u16> = label.encode_utf16().collect();
+                    body.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+                    surface.context.DrawText(
+                        &text,
+                        &body,
+                        &D2D_RECT_F { left: rect.left + 12.0, top: rect.top, right: rect.right, bottom: rect.bottom },
+                        &surface.foreground,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+            }
+
+            // App rows: icon + label.
+            for (i, (label, icon_path)) in apps.iter().enumerate() {
+                if let Some(rect) = layout.apps.get(i) {
+                    if hover == Some(LauncherHit::App(i)) {
+                        surface.context.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT { rect: *rect, radiusX: 6.0, radiusY: 6.0 },
+                            &surface.bar_pill_fill,
+                        );
+                    }
+                    let icon_rect = D2D_RECT_F {
+                        left: rect.left + 4.0,
+                        top: rect.top + 3.0,
+                        right: rect.left + 4.0 + 28.0,
+                        bottom: rect.top + 3.0 + 28.0,
+                    };
+                    // Icon: cache per-surface, same proven sequencing as folder_stack.
+                    if !surface.icons.contains_key(icon_path)
+                        && let Some(bitmap) = load_icon_bitmap(&wic, &surface.context, icon_path)
+                    {
+                        surface.icons.insert(icon_path.clone(), bitmap);
+                    }
+                    if let Some(bitmap) = surface.icons.get(icon_path) {
+                        surface.context.DrawBitmap(
+                            bitmap,
+                            Some(&icon_rect),
+                            1.0,
+                            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                            None,
+                            None,
+                        );
+                    }
+                    let text: Vec<u16> = label.encode_utf16().collect();
+                    small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+                    surface.context.DrawText(
+                        &text,
+                        &small,
+                        &D2D_RECT_F {
+                            left: icon_rect.right + 8.0,
+                            top: rect.top,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        },
+                        &surface.foreground,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+            }
+
+            let action = present(surface);
+            if matches!(action, PresentAction::RecreateAll) {
+                self.device_lost = true;
+            }
+        }
+        Ok(())
+    }
+
     pub fn paint_preview(
         &mut self,
         hwnd: HWND,

@@ -1191,6 +1191,28 @@ impl App {
             // clear the captured window between frames and cause a visible flash.
             Some(WindowKind::LaunchOverlay) => Ok(()),
             Some(WindowKind::DebugPopover) => self.renderer.paint_debug_popover(hwnd),
+            Some(WindowKind::Launcher) => match self.launcher.as_ref() {
+                Some(launcher) => {
+                    let visible = launcher
+                        .apps
+                        .len()
+                        .min(crate::render::LAUNCHER_MAX_VISIBLE_ROWS);
+                    let apps_window: Vec<(String, std::path::PathBuf)> = launcher
+                        .apps
+                        .iter()
+                        .skip(launcher.scroll)
+                        .take(visible)
+                        .cloned()
+                        .collect();
+                    self.renderer.paint_launcher(
+                        hwnd,
+                        LAUNCHER_ACTION_LABELS,
+                        &apps_window,
+                        launcher.hover,
+                    )
+                }
+                None => Ok(()),
+            },
             _ => Ok(()),
         };
         unsafe {
