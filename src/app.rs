@@ -4,7 +4,7 @@ use crate::{
     config::{ConfigV1, PinConfig, PinKind},
     model::{DockItem, MonitorInfo, WindowEntry, enumerate_monitors, group_for_monitor},
     render::{
-        DockBounce, DockHover, DockRenderState, DockVisual, Renderer, TopBarSegment,
+        DockBounce, DockHover, DockRenderState, DockVisual, LauncherHit, Renderer, TopBarSegment,
         TopBarSegmentFlags, TopBarStatus,
     },
     shell::{AppBar, TaskbarState},
@@ -66,8 +66,8 @@ use windows::{
                 SetForegroundWindow, SetTimer, ShowWindow, SystemParametersInfoW, TPM_RETURNCMD,
                 TrackPopupMenu, TranslateMessage, WINDOWPLACEMENT, WM_APP, WM_CAPTURECHANGED,
                 WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES, WM_HOTKEY,
-                WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST,
-                WM_PAINT,
+                WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE,
+                WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT,
                 WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
                 WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
@@ -115,6 +115,10 @@ const CMD_POWER_SLEEP: usize = 315;
 const CMD_POWER_RESTART: usize = 316;
 const CMD_POWER_SHUTDOWN: usize = 317;
 const CMD_POWER_LOCK: usize = 318;
+/// Fixed launcher quick-action labels in display order. The index matches the
+/// `match` in `launcher_click`'s `LauncherHit::Action(i)` arm.
+const LAUNCHER_ACTION_LABELS: &[&str] =
+    &["Start", "Run…", "File Explorer", "Lock", "Sleep", "Restart", "Shut Down"];
 pub const WM_REFRESH: u32 = WM_APP + 1;
 const WM_REBUILD_MONITORS: u32 = WM_APP + 2;
 const WM_FOREGROUND_CHANGED: u32 = WM_APP + 3;
@@ -142,6 +146,7 @@ enum WindowKind {
     FolderStack,
     LaunchOverlay,
     DebugPopover,
+    Launcher,
 }
 
 struct Preview {
@@ -163,6 +168,20 @@ struct FolderStack {
     hover: Option<usize>,
     footer_hover: bool,
     pointer_x: f32,
+}
+
+/// State for the open launcher popover. `apps` is the full enumerated list;
+/// `scroll` is the index of the first visible row; `hover` is the currently
+/// highlighted target (action index or visible app index).
+struct LauncherState {
+    hwnd: HWND,
+    owner: HWND,
+    /// (label, .lnk path) for each Start Menu app, alphabetical.
+    apps: Vec<(String, std::path::PathBuf)>,
+    /// Index of the first visible app row.
+    scroll: usize,
+    /// Currently hovered target.
+    hover: Option<LauncherHit>,
 }
 
 /// A single topbar popover window. Only one is ever open at a time
@@ -259,6 +278,7 @@ pub struct App {
     last_genie_snapshot: Option<(isize, Instant)>,
     last_clock: String,
     active_popover: Option<Popover>,
+    launcher: Option<LauncherState>,
 }
 
 impl App {
@@ -311,6 +331,7 @@ impl App {
             last_genie_snapshot: None,
             last_clock,
             active_popover: None,
+            launcher: None,
         };
         if app.config.behavior.replace_taskbar {
             app.taskbar.hide();
@@ -2231,7 +2252,7 @@ impl App {
                     .flatten()
                     .and_then(TopBarSegment::decode);
                 match segment {
-                    Some(TopBarSegment::Logo) => self.handle_command(CMD_START_MENU),
+                    Some(TopBarSegment::Logo) => self.open_launcher(hwnd),
                     Some(TopBarSegment::App) => self.show_top_menu(hwnd),
                     Some(
                         TopBarSegment::Network | TopBarSegment::Volume | TopBarSegment::Battery,
@@ -2859,12 +2880,107 @@ impl App {
 
     fn close_popover(&mut self) {
         if let Some(popover) = self.active_popover.take() {
+            self.launcher = None;
             self.kinds.remove(&(popover.hwnd.0 as isize));
             self.renderer.forget(popover.hwnd);
             unsafe {
                 let _ = DestroyWindow(popover.hwnd);
                 // Repaint the owner so any open-state affordance clears.
                 let _ = InvalidateRect(Some(popover.owner), None, false);
+            }
+        }
+    }
+
+    fn launcher_click(&mut self, hwnd: HWND, x: i32, y: i32) {
+        let scale = window_scale(hwnd);
+        let x = x as f32 / scale;
+        let y = y as f32 / scale;
+        let Some(launcher) = self.launcher.as_ref() else {
+            return;
+        };
+        let visible = launcher
+            .apps
+            .len()
+            .min(crate::render::LAUNCHER_MAX_VISIBLE_ROWS);
+        let layout = crate::render::launcher_geometry(
+            crate::render::LAUNCHER_WIDTH,
+            crate::render::launcher_height(LAUNCHER_ACTION_LABELS.len(), launcher.apps.len()),
+            LAUNCHER_ACTION_LABELS.len(),
+            visible,
+        );
+        match crate::render::launcher_hit_test(&layout, x, y) {
+            LauncherHit::Action(i) => {
+                match i {
+                    0 => open_start_menu(),
+                    1 => send_windows_shortcut(b'R'),
+                    2 => launch_path(std::path::Path::new("explorer.exe")),
+                    3 => power_action(PowerAction::Lock),
+                    4 => power_action(PowerAction::Sleep),
+                    5 => power_action(PowerAction::Restart),
+                    6 => power_action(PowerAction::Shutdown),
+                    _ => {}
+                }
+                self.close_popover();
+            }
+            LauncherHit::App(visible_i) => {
+                let path = self
+                    .launcher
+                    .as_ref()
+                    .and_then(|l| l.apps.get(l.scroll + visible_i))
+                    .map(|(_, p)| p.clone());
+                self.close_popover();
+                if let Some(path) = path {
+                    launch_path(&path);
+                }
+            }
+            LauncherHit::None => {}
+        }
+    }
+
+    fn launcher_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
+        let scale = window_scale(hwnd);
+        let x = x as f32 / scale;
+        let y = y as f32 / scale;
+        let Some(launcher) = self.launcher.as_mut() else {
+            return;
+        };
+        let visible = launcher
+            .apps
+            .len()
+            .min(crate::render::LAUNCHER_MAX_VISIBLE_ROWS);
+        let layout = crate::render::launcher_geometry(
+            crate::render::LAUNCHER_WIDTH,
+            crate::render::launcher_height(LAUNCHER_ACTION_LABELS.len(), launcher.apps.len()),
+            LAUNCHER_ACTION_LABELS.len(),
+            visible,
+        );
+        let new_hover = crate::render::launcher_hit_test(&layout, x, y);
+        if Some(new_hover) != launcher.hover {
+            launcher.hover = Some(new_hover);
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+    }
+
+    fn launcher_scroll(&mut self, hwnd: HWND, delta: i32) {
+        let Some(launcher) = self.launcher.as_mut() else {
+            return;
+        };
+        let visible = crate::render::LAUNCHER_MAX_VISIBLE_ROWS;
+        if launcher.apps.len() <= visible {
+            return;
+        }
+        let step = 3;
+        let new_scroll = if delta > 0 {
+            launcher.scroll.saturating_sub(step)
+        } else {
+            (launcher.scroll + step).min(launcher.apps.len().saturating_sub(visible))
+        };
+        if new_scroll != launcher.scroll {
+            launcher.scroll = new_scroll;
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
         }
     }
@@ -2928,6 +3044,29 @@ impl App {
             return;
         }
         self.open_popover(owner, WindowKind::DebugPopover, 220, 120);
+    }
+
+    fn open_launcher(&mut self, owner: HWND) {
+        let apps = enumerate_start_menu();
+        let height = crate::render::launcher_height(LAUNCHER_ACTION_LABELS.len(), apps.len());
+        self.open_popover(
+            owner,
+            WindowKind::Launcher,
+            crate::render::LAUNCHER_WIDTH as i32,
+            height.round() as i32,
+        );
+        if let Some(popover) = &self.active_popover {
+            self.launcher = Some(LauncherState {
+                hwnd: popover.hwnd,
+                owner: popover.owner,
+                apps,
+                scroll: 0,
+                hover: None,
+            });
+            unsafe {
+                let _ = InvalidateRect(Some(popover.hwnd), None, false);
+            }
+        }
     }
 
     fn folder_stack_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
@@ -3026,7 +3165,7 @@ unsafe extern "system" fn window_proc(
             if with_app_value(false, |app| {
                 matches!(
                     app.kinds.get(&(hwnd.0 as isize)),
-                    Some(WindowKind::DebugPopover)
+                    Some(WindowKind::DebugPopover) | Some(WindowKind::Launcher)
                 )
             }) {
                 return LRESULT(HTCLIENT as isize);
@@ -3058,6 +3197,15 @@ unsafe extern "system" fn window_proc(
             return LRESULT(0);
         }
         WM_MOUSEMOVE => {
+            let is_launcher = with_app_value(false, |app| {
+                app.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::Launcher)
+            });
+            if is_launcher {
+                let x = (lparam.0 as i16) as i32;
+                let y = ((lparam.0 >> 16) as i16) as i32;
+                with_app(|app| app.launcher_mouse_move(hwnd, x, y));
+                return LRESULT(0);
+            }
             with_app(|app| {
                 app.mouse_move(
                     hwnd,
@@ -3071,6 +3219,16 @@ unsafe extern "system" fn window_proc(
             with_app(|app| app.mouse_leave(hwnd));
             return LRESULT(0);
         }
+        WM_MOUSEWHEEL => {
+            let is_launcher = with_app_value(false, |app| {
+                app.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::Launcher)
+            });
+            if is_launcher {
+                let delta = ((wparam.0 >> 16) as i16) as i32;
+                with_app(|app| app.launcher_scroll(hwnd, delta));
+                return LRESULT(0);
+            }
+        }
         WM_LBUTTONDOWN => {
             let is_popover = with_app_value(false, |app| {
                 matches!(
@@ -3080,6 +3238,15 @@ unsafe extern "system" fn window_proc(
             });
             if is_popover {
                 with_app(|app| app.close_popover());
+                return LRESULT(0);
+            }
+            let is_launcher = with_app_value(false, |app| {
+                app.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::Launcher)
+            });
+            if is_launcher {
+                let x = (lparam.0 as i16) as i32;
+                let y = ((lparam.0 >> 16) as i16) as i32;
+                with_app(|app| app.launcher_click(hwnd, x, y));
                 return LRESULT(0);
             }
             with_app(|app| app.mouse_down(hwnd, (lparam.0 as i16) as i32));
@@ -3397,6 +3564,43 @@ fn open_start_menu() {
     unsafe {
         keybd_event(VK_LWIN.0 as u8, 0, Default::default(), 0);
         keybd_event(VK_LWIN.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
+/// Enumerate Start Menu apps (system + user), alphabetical, as (label, .lnk).
+/// Caps at 64 entries.
+fn enumerate_start_menu() -> Vec<(String, std::path::PathBuf)> {
+    let mut entries = Vec::new();
+    let dirs: [Option<std::path::PathBuf>; 2] = [
+        std::env::var_os("ProgramData")
+            .map(|p| std::path::PathBuf::from(p).join(r"Microsoft\Windows\Start Menu\Programs")),
+        std::env::var_os("APPDATA")
+            .map(|p| std::path::PathBuf::from(p).join(r"Microsoft\Windows\Start Menu\Programs")),
+    ];
+    for dir in dirs.into_iter().flatten() {
+        collect_lnk(&dir, &mut entries);
+    }
+    entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    entries.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+    entries.truncate(64);
+    entries
+}
+
+fn collect_lnk(dir: &std::path::Path, out: &mut Vec<(String, std::path::PathBuf)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_lnk(&path, out);
+            continue;
+        }
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+            && let Some(name) = path.file_stem()
+        {
+            out.push((name.to_string_lossy().into_owned(), path));
+        }
     }
 }
 
