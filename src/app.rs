@@ -49,7 +49,7 @@ use windows::{
             Input::KeyboardAndMouse::{
                 KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, ReleaseCapture,
                 SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey, VK_F12,
-                VK_LWIN, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP, keybd_event,
+                VK_ESCAPE, VK_LWIN, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP, keybd_event,
             },
             Shell::{
                 DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, SHERB_NOCONFIRMATION,
@@ -66,7 +66,8 @@ use windows::{
                 SetForegroundWindow, SetTimer, ShowWindow, SystemParametersInfoW, TPM_RETURNCMD,
                 TrackPopupMenu, TranslateMessage, WINDOWPLACEMENT, WM_APP, WM_CAPTURECHANGED,
                 WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES, WM_HOTKEY,
-                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT,
+                WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST,
+                WM_PAINT,
                 WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
                 WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
@@ -1165,6 +1166,7 @@ impl App {
             // Animation frames are painted directly by the timer. Repainting here would
             // clear the captured window between frames and cause a visible flash.
             Some(WindowKind::LaunchOverlay) => Ok(()),
+            Some(WindowKind::DebugPopover) => self.renderer.paint_debug_popover(hwnd),
             _ => Ok(()),
         };
         unsafe {
@@ -2101,6 +2103,10 @@ impl App {
     }
 
     fn mouse_down(&mut self, hwnd: HWND, x: i32) {
+        if self.active_popover.is_some() {
+            self.close_popover();
+            return;
+        }
         if self.kinds.get(&(hwnd.0 as isize)) != Some(&WindowKind::Dock) {
             return;
         }
@@ -2448,6 +2454,7 @@ impl App {
             );
             let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, w!("YumeDock settings"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, CMD_DEBUG_POPOVER, w!("Debug popover"));
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
@@ -2502,6 +2509,12 @@ impl App {
 
     fn handle_command(&mut self, command: usize) {
         match command {
+            CMD_DEBUG_POPOVER => {
+                if let Some(owner) = self.shells.first().map(|shell| shell.top) {
+                    self.toggle_debug_popover(owner);
+                }
+                return;
+            }
             CMD_START_MENU => open_start_menu(),
             CMD_QUICK_SETTINGS => send_windows_shortcut(b'A'),
             CMD_NOTIFICATION_CENTER => send_windows_shortcut(b'N'),
@@ -2841,6 +2854,8 @@ impl App {
             self.renderer.forget(popover.hwnd);
             unsafe {
                 let _ = DestroyWindow(popover.hwnd);
+                // Repaint the owner so any open-state affordance clears.
+                let _ = InvalidateRect(Some(popover.owner), None, false);
             }
         }
     }
@@ -2998,6 +3013,15 @@ unsafe extern "system" fn window_proc(
             }) {
                 return LRESULT(HTTRANSPARENT as isize);
             }
+            // Popover windows are fully client-hittable so they receive clicks.
+            if with_app_value(false, |app| {
+                matches!(
+                    app.kinds.get(&(hwnd.0 as isize)),
+                    Some(WindowKind::DebugPopover)
+                )
+            }) {
+                return LRESULT(HTCLIENT as isize);
+            }
             let screen_x = (lparam.0 as i16) as i32;
             let screen_y = ((lparam.0 >> 16) as i16) as i32;
             if let Some(hit) =
@@ -3039,11 +3063,25 @@ unsafe extern "system" fn window_proc(
             return LRESULT(0);
         }
         WM_LBUTTONDOWN => {
+            let is_popover = with_app_value(false, |app| {
+                matches!(
+                    app.kinds.get(&(hwnd.0 as isize)),
+                    Some(WindowKind::DebugPopover)
+                )
+            });
+            if is_popover {
+                with_app(|app| app.close_popover());
+                return LRESULT(0);
+            }
             with_app(|app| app.mouse_down(hwnd, (lparam.0 as i16) as i32));
             return LRESULT(0);
         }
         WM_LBUTTONUP => {
             with_app(|app| app.mouse_up(hwnd));
+            return LRESULT(0);
+        }
+        WM_KEYDOWN if wparam.0 as i32 == VK_ESCAPE.0 as i32 => {
+            with_app(|app| app.close_popover());
             return LRESULT(0);
         }
         WM_CAPTURECHANGED => {

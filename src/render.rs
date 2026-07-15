@@ -1200,6 +1200,45 @@ impl Renderer {
         Ok(())
     }
 
+    /// Phase-1c verification surface: a labelled rectangle. Replaced by real
+    /// popovers in Phases 2–4. Proves the popover lifecycle (create → render
+    /// → dismiss) before any feature depends on it.
+    pub fn paint_debug_popover(&mut self, hwnd: HWND) -> Result<()> {
+        if self.handle_device_loss_if_needed() {
+            return Ok(());
+        }
+        let body = self.body.clone();
+        let surface = self.surface(hwnd)?;
+        let size = unsafe { surface.context.GetSize() };
+        unsafe {
+            surface.context.BeginDraw();
+            surface.context.Clear(Some(&color(0x0c, 0x0f, 0x14, 0.92)));
+            let rect = D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: size.width,
+                bottom: size.height,
+            };
+            let text: Vec<u16> = "Popover OK"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            surface.context.DrawText(
+                &text,
+                &body,
+                &rect,
+                &surface.foreground,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            let action = present(surface);
+            if matches!(action, PresentAction::RecreateAll) {
+                self.device_lost = true;
+            }
+        }
+        Ok(())
+    }
+
     pub fn paint_preview(
         &mut self,
         hwnd: HWND,
