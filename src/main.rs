@@ -2,6 +2,8 @@
 
 mod app;
 mod config;
+mod deviceloss;
+mod log;
 mod model;
 mod render;
 mod shell;
