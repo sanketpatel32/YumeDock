@@ -1791,6 +1791,106 @@ pub fn top_bar_hit_test(geo: &TopBarGeometry, x: f32) -> Option<TopBarSegment> {
         .map(|(seg, _)| *seg)
 }
 
+/// Layout of the launcher popover. Coordinates are in DIPs relative to the
+/// popover window's top-left.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LauncherLayout {
+    pub width: f32,
+    pub height: f32,
+    /// One entry per quick action (Start, Run, Explorer, Sleep, Restart,
+    /// Shutdown, Lock). Order is fixed.
+    pub actions: Vec<D2D_RECT_F>,
+    /// One entry per visible app row. Indices are into the *visible window*
+    /// of the full list, i.e. shifted by the scroll offset.
+    pub apps: Vec<D2D_RECT_F>,
+}
+
+const LAUNCHER_PAD: f32 = 12.0;
+const LAUNCHER_ROW_H: f32 = 34.0;
+const LAUNCHER_ACTION_H: f32 = 36.0;
+const LAUNCHER_HEADER_GAP: f32 = 8.0;
+pub const LAUNCHER_MAX_VISIBLE_ROWS: usize = 10;
+pub const LAUNCHER_WIDTH: f32 = 260.0;
+
+/// Compute the launcher layout for a popover of `width`×`height` DIPs with
+/// `action_count` quick actions and `app_visible` app rows currently drawn.
+pub fn launcher_geometry(
+    width: f32,
+    height: f32,
+    action_count: usize,
+    app_visible: usize,
+) -> LauncherLayout {
+    let mut y = LAUNCHER_PAD;
+    let row_w = width - LAUNCHER_PAD * 2.0;
+    let actions: Vec<D2D_RECT_F> = (0..action_count)
+        .map(|_| {
+            let rect = D2D_RECT_F {
+                left: LAUNCHER_PAD,
+                top: y,
+                right: LAUNCHER_PAD + row_w,
+                bottom: y + LAUNCHER_ACTION_H,
+            };
+            y += LAUNCHER_ACTION_H;
+            rect
+        })
+        .collect();
+    y += LAUNCHER_HEADER_GAP;
+    let apps: Vec<D2D_RECT_F> = (0..app_visible)
+        .map(|_| {
+            let rect = D2D_RECT_F {
+                left: LAUNCHER_PAD,
+                top: y,
+                right: LAUNCHER_PAD + row_w,
+                bottom: y + LAUNCHER_ROW_H,
+            };
+            y += LAUNCHER_ROW_H;
+            rect
+        })
+        .collect();
+    LauncherLayout {
+        width,
+        height,
+        actions,
+        apps,
+    }
+}
+
+/// What a point in the launcher hits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherHit {
+    Action(usize),
+    App(usize),
+    None,
+}
+
+pub fn launcher_hit_test(layout: &LauncherLayout, x: f32, y: f32) -> LauncherHit {
+    if let Some(i) = layout
+        .actions
+        .iter()
+        .position(|r| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom)
+    {
+        return LauncherHit::Action(i);
+    }
+    if let Some(i) = layout
+        .apps
+        .iter()
+        .position(|r| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom)
+    {
+        return LauncherHit::App(i);
+    }
+    LauncherHit::None
+}
+
+/// Given a total app count and the visible-row capacity, the popover height.
+pub fn launcher_height(action_count: usize, app_total: usize) -> f32 {
+    let visible = app_total.min(LAUNCHER_MAX_VISIBLE_ROWS);
+    LAUNCHER_PAD
+        + action_count as f32 * LAUNCHER_ACTION_H
+        + LAUNCHER_HEADER_GAP
+        + visible as f32 * LAUNCHER_ROW_H
+        + LAUNCHER_PAD
+}
+
 pub fn dock_hit_test(
     x: f32,
     width: f32,
@@ -2427,8 +2527,9 @@ fn bolt_figure() -> LocalFigure {
 #[cfg(test)]
 mod tests {
     use super::{
-        RectExt, TopBarSegment, TopBarSegmentFlags, TopBarStatus, dock_geometry, smoothstep,
-        top_bar_geometry, top_bar_hit_test,
+        LAUNCHER_MAX_VISIBLE_ROWS, LauncherHit, LauncherLayout, dock_geometry,
+        launcher_geometry, launcher_height, launcher_hit_test, smoothstep, top_bar_geometry,
+        top_bar_hit_test, RectExt, TopBarSegment, TopBarSegmentFlags, TopBarStatus,
     };
 
     fn full_status() -> TopBarStatus {
@@ -2541,5 +2642,53 @@ mod tests {
             top_bar_hit_test(&geo, battery.center_x()),
             Some(TopBarSegment::Battery)
         );
+    }
+
+    #[test]
+    fn launcher_geometry_stacks_actions_then_apps_with_gap() {
+        let layout = launcher_geometry(260.0, 400.0, 3, 2);
+        assert_eq!(layout.actions.len(), 3);
+        assert_eq!(layout.apps.len(), 2);
+        // Actions start at top padding.
+        assert_eq!(layout.actions[0].top, 12.0);
+        // Actions are contiguous.
+        assert_eq!(layout.actions[1].top, 12.0 + 36.0);
+        assert_eq!(layout.actions[2].top, 12.0 + 72.0);
+        // Gap between last action and first app row.
+        assert_eq!(layout.apps[0].top, 12.0 + 3.0 * 36.0 + 8.0);
+        // App rows are contiguous and use the row height.
+        assert_eq!(layout.apps[1].top, layout.apps[0].top + 34.0);
+    }
+
+    #[test]
+    fn launcher_hit_test_distinguishes_actions_and_apps() {
+        let layout = launcher_geometry(260.0, 400.0, 2, 3);
+        // Center of action 0.
+        assert_eq!(
+            launcher_hit_test(&layout, 130.0, 12.0 + 18.0),
+            LauncherHit::Action(0)
+        );
+        // Center of app 0 (after gap).
+        let app0_center_y = 12.0 + 2.0 * 36.0 + 8.0 + 17.0;
+        assert_eq!(
+            launcher_hit_test(&layout, 130.0, app0_center_y),
+            LauncherHit::App(0)
+        );
+        // A point in the gap between actions and apps misses both.
+        let gap_y = 12.0 + 2.0 * 36.0 + 4.0;
+        assert_eq!(
+            launcher_hit_test(&layout, 130.0, gap_y),
+            LauncherHit::None
+        );
+    }
+
+    #[test]
+    fn launcher_height_caps_visible_rows() {
+        // 20 apps but only LAUNCHER_MAX_VISIBLE_ROWS (10) shown.
+        let h_full = launcher_height(3, 20);
+        let h_capped = launcher_height(3, 10);
+        assert!((h_full - h_capped).abs() < 0.001);
+        // 5 apps is shorter.
+        assert!(launcher_height(3, 5) < h_capped);
     }
 }
