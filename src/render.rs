@@ -75,6 +75,8 @@ use windows::{
     core::{Interface, PCWSTR, w},
 };
 
+use crate::deviceloss::{DeviceLossPolicy, PresentAction};
+
 const ICON_GAP: f32 = 7.0;
 const SECTION_GAP: f32 = 13.0;
 
@@ -400,6 +402,40 @@ impl Renderer {
         }
     }
 
+    /// Called at the top of every paint path. If a prior `Present`/`EndDraw`
+    /// reported device loss, recreate the D3D/D2D device stack and drop all
+    /// surfaces so they are rebuilt on their next access. Returns `true` if a
+    /// recreation just happened (the caller should skip painting this frame).
+    pub fn handle_device_loss_if_needed(&mut self) -> bool {
+        if !self.device_lost {
+            return false;
+        }
+        match unsafe { Self::recreate_device() } {
+            Ok(parts) => {
+                self._d3d_device = parts.d3d_device;
+                self._immediate_context = parts.immediate_context;
+                self.d2d_device = parts.d2d_device;
+                self.factory = parts.factory;
+                self.dxgi_factory = parts.dxgi_factory;
+                self.composition = parts.composition;
+                self.surfaces.clear();
+                self.genie_cache.clear();
+                self.geo_wifi = None;
+                self.geo_speaker = None;
+                self.geo_speaker_muted = None;
+                self.geo_battery = None;
+                self.geo_bolt = None;
+                self.device_lost = false;
+                true
+            }
+            Err(error) => {
+                // Recreation failed — leave `device_lost` set so we retry next frame.
+                eprintln!("device recreation failed: {error:#}");
+                false
+            }
+        }
+    }
+
     pub fn set_high_contrast(&mut self, high_contrast: bool) {
         self.high_contrast = high_contrast;
         self.surfaces.clear();
@@ -651,6 +687,9 @@ impl Renderer {
     }
 
     pub fn paint_genie(&mut self, hwnd: HWND, destinations: &[RECT], opacity: f32) -> Result<()> {
+        if self.handle_device_loss_if_needed() {
+            return Ok(());
+        }
         let surface = self.surface(hwnd)?;
         let bitmap = surface
             .genie_bitmap
@@ -690,7 +729,10 @@ impl Renderer {
                     None,
                 );
             }
-            present_immediate(surface)?;
+            let action = present_immediate(surface);
+            if matches!(action, PresentAction::RecreateAll) {
+                self.device_lost = true;
+            }
         }
         Ok(())
     }
@@ -705,6 +747,9 @@ impl Renderer {
         flags: TopBarSegmentFlags,
         hover: Option<TopBarSegment>,
     ) -> Result<()> {
+        if self.handle_device_loss_if_needed() {
+            return Ok(());
+        }
         let high_contrast = self.high_contrast;
         let body = self.body.clone();
         let bold = self.bold.clone();
@@ -945,7 +990,10 @@ impl Renderer {
             // either in LEADING/TRAILING corrupts the dock's centered labels.
             small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             body.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            present(surface)?;
+            let action = present(surface);
+            if matches!(action, PresentAction::RecreateAll) {
+                self.device_lost = true;
+            }
         }
         Ok(())
     }
@@ -959,6 +1007,9 @@ impl Renderer {
         footer_hover: bool,
         pointer_x: f32,
     ) -> Result<()> {
+        if self.handle_device_loss_if_needed() {
+            return Ok(());
+        }
         const COLUMNS: usize = 5;
         const CELL_WIDTH: f32 = 72.0;
         const CELL_HEIGHT: f32 = 76.0;
@@ -1135,7 +1186,10 @@ impl Renderer {
                     &fill,
                 );
             }
-            present(surface)?;
+            let action = present(surface);
+            if matches!(action, PresentAction::RecreateAll) {
+                self.device_lost = true;
+            }
         }
         Ok(())
     }
@@ -1147,6 +1201,9 @@ impl Renderer {
         close_hover: bool,
         pointer_x: f32,
     ) -> Result<()> {
+        if self.handle_device_loss_if_needed() {
+            return Ok(());
+        }
         let high_contrast = self.high_contrast;
         let body = self.body.clone();
         let small = self.small.clone();
@@ -1261,7 +1318,10 @@ impl Renderer {
                     &fill,
                 );
             }
-            present(surface)?;
+            let action = present(surface);
+            if matches!(action, PresentAction::RecreateAll) {
+                self.device_lost = true;
+            }
         }
         Ok(())
     }
@@ -1273,6 +1333,9 @@ impl Renderer {
         icon_size: f32,
         state: DockRenderState,
     ) -> Result<()> {
+        if self.handle_device_loss_if_needed() {
+            return Ok(());
+        }
         let small = self.small.clone();
         let wic = self.wic.clone();
         let surface = self.surface(hwnd)?;
@@ -1580,7 +1643,10 @@ impl Renderer {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
-            present(surface)?;
+            let action = present(surface);
+            if matches!(action, PresentAction::RecreateAll) {
+                self.device_lost = true;
+            }
         }
         Ok(())
     }
@@ -1798,23 +1864,31 @@ unsafe fn create_target_bitmap(
     }
 }
 
-unsafe fn present(surface: &Surface) -> Result<()> {
+/// Submit a synced frame and return how the result should be handled. The
+/// caller sets `device_lost` from the returned action after this returns
+/// (the surface borrow is released by then).
+unsafe fn present(surface: &Surface) -> crate::deviceloss::PresentAction {
+    use crate::deviceloss::PresentAction;
     unsafe {
-        surface.context.EndDraw(None, None)?;
-        surface.swap_chain.Present(1, DXGI_PRESENT(0)).ok()?;
+        if surface.context.EndDraw(None, None).is_err() {
+            return PresentAction::RecreateAll;
+        }
+        let hr = surface.swap_chain.Present(1, DXGI_PRESENT(0));
+        DeviceLossPolicy::classify_present(hr.0)
     }
-    Ok(())
 }
 
-/// Submit animation frames without waiting inside the UI thread. DWM still composites
-/// the DirectComposition surface on its own vsync, but the timer remains free to build
-/// the next frame instead of alternating between a timer wait and a Present wait.
-unsafe fn present_immediate(surface: &Surface) -> Result<()> {
+/// Submit an animation frame without the vsync wait. Same classification as
+/// `present`.
+unsafe fn present_immediate(surface: &Surface) -> crate::deviceloss::PresentAction {
+    use crate::deviceloss::PresentAction;
     unsafe {
-        surface.context.EndDraw(None, None)?;
-        surface.swap_chain.Present(0, DXGI_PRESENT(0)).ok()?;
+        if surface.context.EndDraw(None, None).is_err() {
+            return PresentAction::RecreateAll;
+        }
+        let hr = surface.swap_chain.Present(0, DXGI_PRESENT(0));
+        DeviceLossPolicy::classify_present(hr.0)
     }
-    Ok(())
 }
 
 fn load_icon_bitmap(

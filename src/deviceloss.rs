@@ -17,7 +17,7 @@ pub enum PresentAction {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct DeviceLossPolicy {
+pub(crate) struct DeviceLossPolicy {
     device_lost: bool,
 }
 
@@ -28,7 +28,7 @@ impl DeviceLossPolicy {
     /// which is an `i32`). We cast to `u32` first because the DXGI error
     /// codes (e.g. `0x887A0005`) have bit 31 set and do **not** fit as `i32`
     /// literals — matching on `0x887A0005_i32` would be a compile error.
-    const fn classify_present(hr: i32) -> PresentAction {
+    pub(crate) const fn classify_present(hr: i32) -> PresentAction {
         let hr = hr as u32;
         // DXGI_ERROR_DEVICE_REMOVED  0x887A0005
         // DXGI_ERROR_DEVICE_HUNG     0x887A0006
