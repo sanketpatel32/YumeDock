@@ -408,20 +408,20 @@ impl Renderer {
         let foreground =
             unsafe { context.CreateSolidColorBrush(&color(0xf5, 0xf7, 0xfb, 1.0), None)? };
         let indicator =
-            unsafe { context.CreateSolidColorBrush(&color(0xf4, 0xf6, 0xfa, 0.92), None)? };
+            unsafe { context.CreateSolidColorBrush(&color(0xff, 0xff, 0xff, 0.95), None)? };
         let panel = unsafe {
             context.CreateSolidColorBrush(
                 &color(
-                    0x20,
-                    0x26,
-                    0x2f,
-                    if self.high_contrast { 1.0 } else { 0.46 },
+                    0x18,
+                    0x1c,
+                    0x24,
+                    if self.high_contrast { 1.0 } else { 0.32 },
                 ),
                 None,
             )?
         };
         let outline =
-            unsafe { context.CreateSolidColorBrush(&color(0xdf, 0xe5, 0xee, 0.28), None)? };
+            unsafe { context.CreateSolidColorBrush(&color(0xff, 0xff, 0xff, 0.18), None)? };
         Ok(Surface {
             context,
             swap_chain,
@@ -506,10 +506,10 @@ impl Renderer {
             surface.context.BeginDraw();
             // Bar backdrop: slightly deeper than the dock for separation.
             surface.context.Clear(Some(&color(
-                0x0a,
-                0x0e,
-                0x15,
-                if high_contrast { 1.0 } else { 0.55 },
+                0x0c,
+                0x0f,
+                0x14,
+                if high_contrast { 1.0 } else { 0.48 },
             )));
 
             let pill_fill = surface
@@ -758,7 +758,7 @@ impl Renderer {
                 .context
                 .CreateSolidColorBrush(&color(0x02, 0x05, 0x0a, 0.22), None)?;
             let fill = surface.context.CreateSolidColorBrush(
-                &color(0x20, 0x25, 0x2d, if high_contrast { 1.0 } else { 0.72 }),
+                &color(0x18, 0x1c, 0x24, if high_contrast { 1.0 } else { 0.68 }),
                 None,
             )?;
             let hover_fill = surface
@@ -937,7 +937,7 @@ impl Renderer {
                 .context
                 .CreateSolidColorBrush(&color(0x02, 0x05, 0x0a, 0.25), None)?;
             let fill = surface.context.CreateSolidColorBrush(
-                &color(0x20, 0x25, 0x2d, if high_contrast { 1.0 } else { 0.74 }),
+                &color(0x18, 0x1c, 0x24, if high_contrast { 1.0 } else { 0.70 }),
                 None,
             )?;
             surface.context.FillRoundedRectangle(
@@ -1071,35 +1071,55 @@ impl Renderer {
                 radiusX: 18.0,
                 radiusY: 18.0,
             };
-            let far_shadow = surface
+            // Three-layer shadow for a soft, lifted macOS-style appearance.
+            let outer_shadow = surface
                 .context
-                .CreateSolidColorBrush(&color(0x02, 0x05, 0x0a, 0.15), None)?;
+                .CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.10), None)?;
+            let mid_shadow = surface
+                .context
+                .CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.14), None)?;
             let near_shadow = surface
                 .context
-                .CreateSolidColorBrush(&color(0x02, 0x05, 0x0a, 0.18), None)?;
+                .CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.18), None)?;
+            // Outermost diffuse shadow
             surface.context.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
-                        left: shell.rect.left - 4.0,
-                        top: shell.rect.top + 1.0,
-                        right: shell.rect.right + 4.0,
-                        bottom: shell.rect.bottom + 5.0,
+                        left: shell.rect.left - 6.0,
+                        top: shell.rect.top + 2.0,
+                        right: shell.rect.right + 6.0,
+                        bottom: shell.rect.bottom + 8.0,
                     },
-                    radiusX: 22.0,
-                    radiusY: 22.0,
+                    radiusX: 24.0,
+                    radiusY: 24.0,
                 },
-                &far_shadow,
+                &outer_shadow,
             );
+            // Mid shadow
             surface.context.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
-                        left: shell.rect.left - 1.5,
+                        left: shell.rect.left - 3.0,
+                        top: shell.rect.top + 1.0,
+                        right: shell.rect.right + 3.0,
+                        bottom: shell.rect.bottom + 4.0,
+                    },
+                    radiusX: 21.0,
+                    radiusY: 21.0,
+                },
+                &mid_shadow,
+            );
+            // Near shadow
+            surface.context.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: shell.rect.left - 1.0,
                         top: shell.rect.top,
-                        right: shell.rect.right + 1.5,
+                        right: shell.rect.right + 1.0,
                         bottom: shell.rect.bottom + 2.0,
                     },
-                    radiusX: 19.5,
-                    radiusY: 19.5,
+                    radiusX: 19.0,
+                    radiusY: 19.0,
                 },
                 &near_shadow,
             );
@@ -1107,32 +1127,51 @@ impl Renderer {
             surface
                 .context
                 .DrawRoundedRectangle(&shell, &surface.outline, 1.0, None);
+            // Subtle glass-edge highlight along the top of the dock.
             let top_highlight = surface
                 .context
-                .CreateSolidColorBrush(&color(0xf5, 0xf8, 0xfc, 0.14), None)?;
+                .CreateSolidColorBrush(&color(0xff, 0xff, 0xff, 0.20), None)?;
             surface.context.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
-                        left: shell.rect.left + 18.0,
-                        top: shell.rect.top + 0.75,
-                        right: shell.rect.right - 18.0,
-                        bottom: shell.rect.top + 1.5,
+                        left: shell.rect.left + 12.0,
+                        top: shell.rect.top + 0.5,
+                        right: shell.rect.right - 12.0,
+                        bottom: shell.rect.top + 1.25,
                     },
-                    radiusX: 0.4,
-                    radiusY: 0.4,
+                    radiusX: 0.6,
+                    radiusY: 0.6,
                 },
                 &top_highlight,
             );
-            let bottom_edge = surface
+            // Inner glow along the top inside of the dock for depth.
+            let inner_glow = surface
                 .context
-                .CreateSolidColorBrush(&color(0x02, 0x05, 0x0a, 0.18), None)?;
+                .CreateSolidColorBrush(&color(0xff, 0xff, 0xff, 0.06), None)?;
             surface.context.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
-                        left: shell.rect.left + 18.0,
-                        top: shell.rect.bottom - 1.5,
-                        right: shell.rect.right - 18.0,
-                        bottom: shell.rect.bottom - 0.65,
+                        left: shell.rect.left + 6.0,
+                        top: shell.rect.top + 1.0,
+                        right: shell.rect.right - 6.0,
+                        bottom: shell.rect.top + 4.0,
+                    },
+                    radiusX: 2.0,
+                    radiusY: 2.0,
+                },
+                &inner_glow,
+            );
+            // Subtle bottom edge for grounding.
+            let bottom_edge = surface
+                .context
+                .CreateSolidColorBrush(&color(0x00, 0x00, 0x00, 0.12), None)?;
+            surface.context.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: shell.rect.left + 14.0,
+                        top: shell.rect.bottom - 1.2,
+                        right: shell.rect.right - 14.0,
+                        bottom: shell.rect.bottom - 0.5,
                     },
                     radiusX: 0.4,
                     radiusY: 0.4,
@@ -1255,16 +1294,14 @@ impl Renderer {
                     );
                 }
                 if item.running {
-                    surface.context.FillRoundedRectangle(
-                        &D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
-                                left: center_x - 1.75,
-                                top: shell_bottom - 7.5,
-                                right: center_x + 1.75,
-                                bottom: shell_bottom - 4.0,
-                            },
-                            radiusX: 1.75,
-                            radiusY: 1.75,
+                    // macOS-style circular indicator dot below the icon.
+                    let dot_radius = 2.0;
+                    let dot_cy = shell_bottom - 5.0;
+                    surface.context.FillEllipse(
+                        &D2D1_ELLIPSE {
+                            point: vec2(center_x, dot_cy),
+                            radiusX: dot_radius,
+                            radiusY: dot_radius,
                         },
                         &surface.indicator,
                     );
@@ -1290,7 +1327,7 @@ impl Renderer {
                 };
                 let bubble_fill = surface
                     .context
-                    .CreateSolidColorBrush(&color(0x20, 0x24, 0x2b, 0.92), None)?;
+                    .CreateSolidColorBrush(&color(0x1a, 0x1e, 0x26, 0.94), None)?;
                 surface.context.FillRoundedRectangle(&bubble, &bubble_fill);
                 surface
                     .context
