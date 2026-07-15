@@ -1219,10 +1219,7 @@ impl Renderer {
                 right: size.width,
                 bottom: size.height,
             };
-            let text: Vec<u16> = "Popover OK"
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
+            let text: Vec<u16> = "Popover OK".encode_utf16().collect();
             surface.context.DrawText(
                 &text,
                 &body,
