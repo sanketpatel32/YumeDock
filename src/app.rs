@@ -13,9 +13,12 @@ use crate::{
 use anyhow::Result;
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 use windows::{
@@ -24,16 +27,12 @@ use windows::{
         Graphics::{
             Dwm::{
                 DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
-                DWM_TNP_VISIBLE,
+                DWM_TNP_VISIBLE, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
                 DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-                DWMWCP_ROUND, DwmQueryThumbnailSourceSize,
-                DwmRegisterThumbnail, DwmSetWindowAttribute, DwmUnregisterThumbnail,
-                DwmUpdateThumbnailProperties,
+                DWMWCP_ROUND, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail,
+                DwmSetWindowAttribute, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
             },
-            Gdi::{
-                BeginPaint, CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, EndPaint,
-                InvalidateRect, PAINTSTRUCT, RGN_OR, ScreenToClient, SetWindowRgn,
-            },
+            Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT, ScreenToClient},
         },
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
@@ -50,7 +49,7 @@ use windows::{
             Input::KeyboardAndMouse::{
                 KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, ReleaseCapture,
                 SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, UnregisterHotKey, VK_F12,
-                VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP, keybd_event,
+                VK_LWIN, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP, keybd_event,
             },
             Shell::{
                 DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, SHERB_NOCONFIRMATION,
@@ -58,16 +57,17 @@ use windows::{
             },
             WindowsAndMessaging::{
                 AppendMenuW, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu, CreateWindowExW,
-                DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetClientRect,
-                GetCursorPos, GetForegroundWindow, GetMessageW, HTCLIENT, HTTRANSPARENT, IDC_ARROW,
-                KillTimer, LoadCursorW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
+                DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GA_ROOTOWNER,
+                GetAncestor, GetClientRect, GetCursorPos, GetForegroundWindow, GetMessageW,
+                GetWindowPlacement, HTCLIENT, HTTRANSPARENT, IDC_ARROW, IsIconic, KillTimer,
+                LoadCursorW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
                 PostQuitMessage, PostThreadMessageW, RegisterClassExW, RegisterWindowMessageW,
-                SPI_GETHIGHCONTRAST, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNA, SetForegroundWindow,
-                SetTimer, ShowWindow, SystemParametersInfoW, TPM_RETURNCMD, TrackPopupMenu,
-                TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY,
-                WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES, WM_HOTKEY, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP,
-                WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+                SPI_GETHIGHCONTRAST, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNA,
+                SetForegroundWindow, SetTimer, ShowWindow, SystemParametersInfoW, TPM_RETURNCMD,
+                TrackPopupMenu, TranslateMessage, WINDOWPLACEMENT, WM_APP, WM_CAPTURECHANGED,
+                WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES, WM_HOTKEY,
+                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT,
+                WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
                 WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
@@ -96,6 +96,13 @@ const CMD_VOLUME_MUTE: usize = 115;
 const CMD_AUTO_HIDE: usize = 116;
 const CMD_POWER_SETTINGS: usize = 117;
 const CMD_DATE_MENU: usize = 118;
+const CMD_START_MENU: usize = 119;
+const CMD_QUICK_SETTINGS: usize = 120;
+const CMD_NOTIFICATION_CENTER: usize = 121;
+const CMD_CLOCK_24_HOUR: usize = 122;
+const CMD_SHOW_NETWORK: usize = 123;
+const CMD_SHOW_VOLUME: usize = 124;
+const CMD_SHOW_BATTERY: usize = 125;
 const CMD_OPEN_ITEM: usize = 200;
 const CMD_NEW_INSTANCE: usize = 201;
 const CMD_TOGGLE_PIN: usize = 202;
@@ -104,12 +111,16 @@ const CMD_CLOSE_ITEM: usize = 204;
 const CMD_EMPTY_RECYCLE: usize = 205;
 pub const WM_REFRESH: u32 = WM_APP + 1;
 const WM_REBUILD_MONITORS: u32 = WM_APP + 2;
+const WM_FOREGROUND_CHANGED: u32 = WM_APP + 3;
+const WM_NATIVE_MINIMIZE: u32 = WM_APP + 4;
 const STACK_COLUMNS: usize = 5;
 const STACK_CELL_WIDTH: i32 = 72;
 const STACK_CELL_HEIGHT: i32 = 76;
 const STACK_PADDING: i32 = 16;
 const STACK_HEADER: i32 = 38;
 const STACK_FOOTER: i32 = 38;
+// Enough strips to keep the funnel curved without issuing hundreds of GPU draws per frame.
+const GENIE_SLICES: usize = 72;
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -123,6 +134,7 @@ enum WindowKind {
     Reserve,
     Preview,
     FolderStack,
+    LaunchOverlay,
 }
 
 struct Preview {
@@ -193,22 +205,11 @@ struct DockInteractionGeometry {
     icon_size: f32,
     magnification: f32,
     hidden: bool,
-    hovered: bool,
     bouncing: bool,
     shell_left: f32,
     shell_top: f32,
     shell_right: f32,
     shell_bottom: f32,
-    active_left: f32,
-    active_top: f32,
-    active_right: f32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct DockRegionSignature {
-    hidden: bool,
-    shell: [i32; 4],
-    active: Option<[i32; 4]>,
 }
 
 pub struct App {
@@ -219,6 +220,8 @@ pub struct App {
     hover: HashMap<isize, Option<usize>>,
     cursor_x: HashMap<isize, f32>,
     windows: Vec<WindowEntry>,
+    dock_cache: HashMap<isize, Arc<[DockItem]>>,
+    system_status: status::SystemStatus,
     taskbar: TaskbarState,
     safe_mode: bool,
     shutting_down: bool,
@@ -230,13 +233,15 @@ pub struct App {
     animation: HashMap<isize, f32>,
     animation_clock: HashMap<isize, Instant>,
     launch_bounce: HashMap<isize, LaunchBounce>,
+    pending_window_open: Option<PendingWindowOpen>,
+    window_open_animation: Option<WindowOpenAnimation>,
     auto_hide: HashMap<isize, AutoHideState>,
     drag: Option<DockDrag>,
     reorder_animation: HashMap<isize, ReorderAnimation>,
     cycle_index: HashMap<String, usize>,
     monitor_rebuild_pending: bool,
-    dock_regions: HashMap<isize, DockRegionSignature>,
     high_contrast: bool,
+    last_genie_snapshot: Option<(isize, Instant)>,
 }
 
 impl App {
@@ -255,6 +260,7 @@ impl App {
         );
         let high_contrast = high_contrast_enabled();
         let renderer = Renderer::new(high_contrast)?;
+        let system_status = status::read_status();
         let mut app = Self {
             config,
             renderer,
@@ -263,6 +269,8 @@ impl App {
             hover: HashMap::new(),
             cursor_x: HashMap::new(),
             windows: tracker::enumerate_windows(),
+            dock_cache: HashMap::new(),
+            system_status,
             taskbar: TaskbarState::capture(),
             safe_mode,
             shutting_down: false,
@@ -274,13 +282,15 @@ impl App {
             animation: HashMap::new(),
             animation_clock: HashMap::new(),
             launch_bounce: HashMap::new(),
+            pending_window_open: None,
+            window_open_animation: None,
             auto_hide: HashMap::new(),
             drag: None,
             reorder_animation: HashMap::new(),
             cycle_index: HashMap::new(),
             monitor_rebuild_pending: false,
-            dock_regions: HashMap::new(),
             high_contrast,
+            last_genie_snapshot: None,
         };
         if app.config.behavior.replace_taskbar {
             app.taskbar.hide();
@@ -298,6 +308,8 @@ impl App {
         app._hooks = Some(tracker::HookSet::install(
             unsafe { GetCurrentThreadId() },
             WM_REFRESH,
+            WM_FOREGROUND_CHANGED,
+            WM_NATIVE_MINIMIZE,
         ));
         APP.with(|slot| *slot.borrow_mut() = Some(app));
 
@@ -306,6 +318,14 @@ impl App {
             while GetMessageW(&mut msg, None, 0, 0).into() {
                 if msg.hwnd.is_invalid() && msg.message == WM_REFRESH {
                     with_app(|app| app.schedule_window_refresh());
+                    continue;
+                }
+                if msg.hwnd.is_invalid() && msg.message == WM_FOREGROUND_CHANGED {
+                    with_app(|app| app.refresh_foreground_app());
+                    continue;
+                }
+                if msg.hwnd.is_invalid() && msg.message == WM_NATIVE_MINIMIZE {
+                    with_app(|app| app.handle_native_minimize(HWND(msg.wParam.0 as *mut _)));
                     continue;
                 }
                 if msg.hwnd.is_invalid() && msg.message == WM_REBUILD_MONITORS {
@@ -375,7 +395,9 @@ impl App {
                 false,
             )?;
             configure_window_backdrop(top, false, self.high_contrast);
-            configure_window_backdrop(dock, true, self.high_contrast);
+            // The dock draws its own rounded panel inside a larger transparent host.
+            // Rounding the host itself makes DWM outline the full host rectangle.
+            configure_window_backdrop(dock, false, self.high_contrast);
             self.kinds.insert(top.0 as isize, WindowKind::Top);
             self.kinds.insert(dock.0 as isize, WindowKind::Dock);
             self.kinds.insert(reserve.0 as isize, WindowKind::Reserve);
@@ -412,19 +434,15 @@ impl App {
                 } else {
                     Some(AppBar::register(reserve, false, bottom_rect)?)
                 };
-                (Some(AppBar::register(top, true, top_rect)?), bottom_appbar)
+                let top_appbar = if info.primary {
+                    Some(AppBar::register(top, true, top_rect)?)
+                } else {
+                    None
+                };
+                (top_appbar, bottom_appbar)
             } else {
                 (None, None)
             };
-            unsafe {
-                let _ = ShowWindow(top, SW_SHOWNA);
-                let _ = ShowWindow(dock, SW_SHOWNA);
-                let _ = ShowWindow(reserve, SW_HIDE);
-                SetTimer(Some(top), 1, 5000, None);
-                if self.config.dock.auto_hide {
-                    SetTimer(Some(dock), 8, 1000, None);
-                }
-            }
             self.shells.push(MonitorShell {
                 info,
                 top,
@@ -435,11 +453,41 @@ impl App {
                 icon_size,
                 scale,
             });
+            self.dock_cache.insert(
+                info.handle.0 as isize,
+                Arc::from(group_for_monitor(
+                    &self.config.pins,
+                    &self.windows,
+                    info.handle.0 as isize,
+                )),
+            );
+
+            // Prime and commit each DirectComposition surface while its host is
+            // still hidden. This prevents DWM from exposing an unpainted fallback
+            // frame during cold startup.
+            if info.primary {
+                self.paint(top);
+            }
+            self.paint(dock);
+            unsafe {
+                let _ = ShowWindow(top, if info.primary { SW_SHOWNA } else { SW_HIDE });
+                let _ = ShowWindow(dock, SW_SHOWNA);
+                let _ = ShowWindow(reserve, SW_HIDE);
+                if self.shells.len() == 1 {
+                    SetTimer(Some(top), 1, 5000, None);
+                    SetTimer(Some(top), 12, 250, None);
+                }
+                if self.config.dock.auto_hide {
+                    SetTimer(Some(dock), 8, 1000, None);
+                }
+            }
         }
         Ok(())
     }
 
     fn destroy_monitor_shells(&mut self) {
+        self.close_window_open_animation(false);
+        self.pending_window_open = None;
         self.close_folder_stack();
         self.close_preview();
         self.preview_candidate = None;
@@ -462,7 +510,7 @@ impl App {
         self.auto_hide.clear();
         self.drag = None;
         self.reorder_animation.clear();
-        self.dock_regions.clear();
+        self.dock_cache.clear();
     }
 
     fn rebuild_monitors(&mut self) {
@@ -503,17 +551,104 @@ impl App {
     }
 
     fn refresh_windows(&mut self) {
+        let previous_apps: HashSet<String> = self
+            .windows
+            .iter()
+            .map(|window| window.identity.icon_key.to_ascii_lowercase())
+            .collect();
         self.windows = tracker::enumerate_windows();
+        self.rebuild_dock_cache();
+        let opened_apps: HashSet<String> = self
+            .windows
+            .iter()
+            .map(|window| window.identity.icon_key.to_ascii_lowercase())
+            .filter(|key| !previous_apps.contains(key))
+            .collect();
         self.stop_ready_launch_bounces();
+        let mut new_bounces = Vec::new();
         for shell in &self.shells {
+            if !opened_apps.is_empty() && !self.launch_bounce.contains_key(&(shell.dock.0 as isize))
+            {
+                let items = self.dock_items(shell.dock);
+                if let Some((item, key)) = items.iter().enumerate().find_map(|(index, item)| {
+                    let DockItem::Application { windows, .. } = item else {
+                        return None;
+                    };
+                    let opened = windows.iter().any(|hwnd| {
+                        self.windows
+                            .iter()
+                            .find(|window| window.hwnd == *hwnd)
+                            .map(|window| window.identity.icon_key.to_ascii_lowercase())
+                            .is_some_and(|key| opened_apps.contains(&key))
+                    });
+                    opened
+                        .then(|| dock_identity_key(item))
+                        .flatten()
+                        .map(|key| (index, key))
+                }) {
+                    new_bounces.push((shell.dock, item, key));
+                }
+            }
             unsafe {
                 let _ = InvalidateRect(Some(shell.dock), None, false);
                 let _ = InvalidateRect(Some(shell.top), None, false);
             }
         }
+        for (dock, item, key) in new_bounces {
+            self.start_launch_bounce(dock, item, key, false);
+        }
+        self.refresh_launch_bounce_items();
+
+        let pending_ready = self.pending_window_open.as_ref().and_then(|pending| {
+            let items = self.dock_items(pending.dock);
+            items.iter().find_map(|item| {
+                if dock_identity_key(item).as_deref() != Some(pending.key.as_str()) {
+                    return None;
+                }
+                let DockItem::Application { windows, .. } = item else {
+                    return None;
+                };
+                windows
+                    .first()
+                    .copied()
+                    .map(|source| (pending.dock, pending.origin, source))
+            })
+        });
+        if let Some((dock, origin, source)) = pending_ready {
+            self.pending_window_open = None;
+            self.start_window_open_animation(dock, source, origin, true);
+        } else if self
+            .pending_window_open
+            .as_ref()
+            .is_some_and(|pending| pending.started.elapsed() >= Duration::from_secs(8))
+        {
+            self.pending_window_open = None;
+        }
+    }
+
+    fn refresh_launch_bounce_items(&mut self) {
+        let updates: Vec<_> = self
+            .shells
+            .iter()
+            .filter_map(|shell| {
+                let dock = shell.dock.0 as isize;
+                let key = &self.launch_bounce.get(&dock)?.key;
+                let items = self.dock_items(shell.dock);
+                let item = items
+                    .iter()
+                    .position(|item| dock_identity_key(item).as_deref() == Some(key.as_str()))?;
+                Some((dock, item))
+            })
+            .collect();
+        for (dock, item) in updates {
+            if let Some(state) = self.launch_bounce.get_mut(&dock) {
+                state.item = item;
+            }
+        }
     }
 
     fn refresh_system_settings(&mut self) {
+        self.system_status = status::read_status();
         let high_contrast = high_contrast_enabled();
         if self.high_contrast != high_contrast {
             self.high_contrast = high_contrast;
@@ -521,6 +656,83 @@ impl App {
             self.rebuild_monitors();
         } else {
             self.refresh_windows();
+        }
+    }
+
+    fn refresh_system_status(&mut self) {
+        self.system_status = status::read_status();
+        for shell in &self.shells {
+            unsafe {
+                let _ = InvalidateRect(Some(shell.top), None, false);
+            }
+        }
+    }
+
+    fn refresh_foreground_app(&mut self) {
+        self.last_genie_snapshot = None;
+        for shell in &self.shells {
+            unsafe {
+                let _ = InvalidateRect(Some(shell.top), None, false);
+            }
+        }
+    }
+
+    fn cache_foreground_for_genie(&mut self) {
+        // A full-window capture on this UI thread would steal a frame from the active transition.
+        if self.window_open_animation.is_some() {
+            return;
+        }
+        let source = unsafe { GetForegroundWindow() };
+        if source.is_invalid()
+            || unsafe { IsIconic(source).as_bool() }
+            || self.kinds.contains_key(&(source.0 as isize))
+        {
+            return;
+        }
+        let mut rect = RECT::default();
+        if unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(source, &mut rect).is_err()
+        } || rect_width(rect) < 120
+            || rect_height(rect) < 80
+        {
+            return;
+        }
+        let mut cursor = POINT::default();
+        let near_caption = unsafe { GetCursorPos(&mut cursor).is_ok() }
+            && cursor.x >= rect.right - 280
+            && cursor.x <= rect.right
+            && cursor.y >= rect.top
+            && cursor.y <= rect.top + 80;
+        let now = Instant::now();
+        let minimum_age = if near_caption {
+            Duration::from_millis(750)
+        } else {
+            Duration::from_secs(4)
+        };
+        if self.last_genie_snapshot.is_some_and(|(cached, at)| {
+            cached == source.0 as isize && now.duration_since(at) < minimum_age
+        }) {
+            return;
+        }
+        let dock = self
+            .windows
+            .iter()
+            .find(|entry| entry.hwnd == source)
+            .and_then(|entry| {
+                self.shells
+                    .iter()
+                    .find(|shell| shell.info.handle.0 as isize == entry.monitor)
+            })
+            .or_else(|| self.shells.first())
+            .map(|shell| shell.dock);
+        let Some(dock) = dock else {
+            return;
+        };
+        if self
+            .renderer
+            .cache_genie_snapshot(dock, source, rect_width(rect), rect_height(rect))
+        {
+            self.last_genie_snapshot = Some((source.0 as isize, now));
         }
     }
 
@@ -535,14 +747,8 @@ impl App {
                     return None;
                 }
                 let ready = self.shells.iter().any(|candidate| {
-                    group_for_monitor(
-                        &self.config.pins,
-                        &self.windows,
-                        candidate.info.handle.0 as isize,
-                    )
-                    .iter()
-                    .any(|item| {
-                        dock_label(item).eq_ignore_ascii_case(&state.key)
+                    self.dock_items(candidate.dock).iter().any(|item| {
+                        dock_identity_key(item).is_some_and(|key| key == state.key)
                             && matches!(item, DockItem::Application { windows, .. } if !windows.is_empty())
                     })
                 });
@@ -562,7 +768,16 @@ impl App {
     fn schedule_window_refresh(&self) {
         if let Some(shell) = self.shells.first() {
             unsafe {
-                SetTimer(Some(shell.top), 5, 250, None);
+                SetTimer(
+                    Some(shell.top),
+                    5,
+                    if self.pending_window_open.is_some() {
+                        60
+                    } else {
+                        250
+                    },
+                    None,
+                );
             }
         } else {
             tracker::mark_refresh_handled();
@@ -600,12 +815,25 @@ impl App {
             .find(|s| s.top == hwnd || s.dock == hwnd || s.reserve == hwnd)
     }
 
-    fn dock_items(&self, hwnd: HWND) -> Vec<DockItem> {
+    fn rebuild_dock_cache(&mut self) {
+        self.dock_cache.clear();
+        for shell in &self.shells {
+            let monitor = shell.info.handle.0 as isize;
+            self.dock_cache.insert(
+                monitor,
+                Arc::from(group_for_monitor(&self.config.pins, &self.windows, monitor)),
+            );
+        }
+    }
+
+    fn dock_items(&self, hwnd: HWND) -> Arc<[DockItem]> {
         let monitor = self
             .monitor_for(hwnd)
             .map(|s| s.info.handle.0 as isize)
             .unwrap_or_default();
-        group_for_monitor(&self.config.pins, &self.windows, monitor)
+        self.dock_cache.get(&monitor).cloned().unwrap_or_else(|| {
+            Arc::from(group_for_monitor(&self.config.pins, &self.windows, monitor))
+        })
     }
 
     fn dock_hit_region(&self, hwnd: HWND, screen_x: i32, screen_y: i32) -> Option<bool> {
@@ -704,11 +932,7 @@ impl App {
         };
         let expansion = icon_size * (magnification - 1.0) * 2.7;
         let shell_width = base_content + expansion + 32.0;
-        let active_half_width =
-            (base_content + expansion + if hovered { 200.0 } else { 48.0 }) / 2.0;
         let bouncing = self.launch_bounce.contains_key(&(hwnd.0 as isize));
-        let label_top = (shell_top - 36.0).max(0.0);
-        let bounce_top = shell_bottom - 9.0 - icon_size * magnification - icon_size * 0.42;
         Some(DockInteractionGeometry {
             scale,
             width,
@@ -718,93 +942,12 @@ impl App {
             icon_size,
             magnification,
             hidden: hide_progress >= 0.98,
-            hovered,
             bouncing,
             shell_left: (width - shell_width) / 2.0,
             shell_top,
             shell_right: (width + shell_width) / 2.0,
             shell_bottom,
-            active_left: width / 2.0 - active_half_width,
-            active_top: if hovered {
-                label_top.min(bounce_top)
-            } else if bouncing {
-                bounce_top
-            } else {
-                shell_top
-            },
-            active_right: width / 2.0 + active_half_width,
         })
-    }
-
-    fn update_dock_window_region(&mut self, hwnd: HWND) {
-        let Some(geometry) = self.dock_interaction_geometry(hwnd) else {
-            return;
-        };
-        let shell = if geometry.hidden {
-            [
-                0,
-                ((geometry.height - 3.0) * geometry.scale).floor() as i32,
-                (geometry.width * geometry.scale).ceil() as i32,
-                (geometry.height * geometry.scale).ceil() as i32,
-            ]
-        } else {
-            [
-                (geometry.shell_left * geometry.scale).floor() as i32,
-                (geometry.shell_top.max(0.0) * geometry.scale).floor() as i32,
-                (geometry.shell_right * geometry.scale).ceil() as i32,
-                (geometry.shell_bottom.min(geometry.height) * geometry.scale).ceil() as i32,
-            ]
-        };
-        let active = (!geometry.hidden && (geometry.hovered || geometry.bouncing)).then(|| {
-            [
-                (geometry.active_left.max(0.0) * geometry.scale).floor() as i32,
-                (geometry.active_top.max(0.0) * geometry.scale).floor() as i32,
-                (geometry.active_right.min(geometry.width) * geometry.scale).ceil() as i32,
-                (geometry.shell_bottom.min(geometry.height) * geometry.scale).ceil() as i32,
-            ]
-        });
-        let signature = DockRegionSignature {
-            hidden: geometry.hidden,
-            shell,
-            active,
-        };
-        if self.dock_regions.get(&(hwnd.0 as isize)) == Some(&signature) {
-            return;
-        }
-        unsafe {
-            let region = if geometry.hidden {
-                CreateRectRgn(shell[0], shell[1], shell[2], shell[3])
-            } else {
-                CreateRoundRectRgn(
-                    shell[0],
-                    shell[1],
-                    shell[2],
-                    shell[3],
-                    scale_i32(36, geometry.scale),
-                    scale_i32(36, geometry.scale),
-                )
-            };
-            if region.is_invalid() {
-                return;
-            }
-            if let Some(active_bounds) = active {
-                let active_region = CreateRectRgn(
-                    active_bounds[0],
-                    active_bounds[1],
-                    active_bounds[2],
-                    active_bounds[3],
-                );
-                if !active_region.is_invalid() {
-                    let _ = CombineRgn(Some(region), Some(region), Some(active_region), RGN_OR);
-                    let _ = DeleteObject(active_region.into());
-                }
-            }
-            if SetWindowRgn(hwnd, Some(region), false) == 0 {
-                let _ = DeleteObject(region.into());
-            } else {
-                self.dock_regions.insert(hwnd.0 as isize, signature);
-            }
-        }
     }
 
     fn paint(&mut self, hwnd: HWND) {
@@ -815,7 +958,7 @@ impl App {
         let result = match self.kinds.get(&(hwnd.0 as isize)).copied() {
             Some(WindowKind::Top) => {
                 let active = active_app_name(&self.windows);
-                let status = status::read_status();
+                let status = self.system_status;
                 let clock = current_clock(self.config.top_bar.use_24_hour_clock);
                 let date = current_date();
                 let hover = self
@@ -845,7 +988,6 @@ impl App {
                 )
             }
             Some(WindowKind::Dock) => {
-                self.update_dock_window_region(hwnd);
                 let items = self.dock_items(hwnd);
                 let visuals: Vec<_> = items
                     .iter()
@@ -984,6 +1126,9 @@ impl App {
                     Ok(())
                 }
             }
+            // Animation frames are painted directly by the timer. Repainting here would
+            // clear the captured window between frames and cause a visible flash.
+            Some(WindowKind::LaunchOverlay) => Ok(()),
             _ => Ok(()),
         };
         unsafe {
@@ -1028,7 +1173,7 @@ impl App {
         }
         if self.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::Top) {
             // Menu-bar segment hover: hit-test against the laid-out segments.
-            let status = status::read_status();
+            let status = self.system_status;
             let active = active_app_name(&self.windows);
             let (width, height) = client_size_dips(hwnd, scale);
             let geo = crate::render::top_bar_geometry(
@@ -1116,12 +1261,11 @@ impl App {
         let changed = previous != next;
         self.hover.insert(hwnd.0 as isize, next);
         if changed {
-            if self.drag.as_ref().is_some_and(|drag| drag.active) {
-                self.cancel_preview_candidate(hwnd);
-                self.close_preview();
-            } else {
-                self.schedule_preview(hwnd, next.and_then(|i| items.get(i)).and_then(first_window));
-            }
+            // macOS Dock hover is icon magnification and a label, not a large
+            // persistent taskbar-style window thumbnail. The preview also
+            // obscured the app and could remain open after pointer transitions.
+            self.cancel_preview_candidate(hwnd);
+            self.close_preview();
             if previous.is_none() {
                 self.animation.insert(
                     hwnd.0 as isize,
@@ -1342,6 +1486,7 @@ impl App {
         if self.config.behavior.reduce_motion {
             return;
         }
+        self.reveal_dock(hwnd);
         self.launch_bounce.insert(
             hwnd.0 as isize,
             LaunchBounce {
@@ -1355,6 +1500,31 @@ impl App {
         unsafe {
             SetTimer(Some(hwnd), 4, 16, None);
             let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    fn cancel_launch_feedback(&mut self) {
+        self.close_window_open_animation(true);
+        self.pending_window_open = None;
+        self.launch_bounce.clear();
+        for shell in &self.shells {
+            if let Some(state) = self.auto_hide.get_mut(&(shell.dock.0 as isize)) {
+                state.progress = state.target;
+                state.last_tick = Instant::now();
+            }
+            unsafe {
+                let _ = KillTimer(Some(shell.dock), 4);
+                let _ = KillTimer(Some(shell.dock), 7);
+                let _ = InvalidateRect(Some(shell.dock), None, false);
+                if self.config.dock.auto_hide {
+                    SetTimer(
+                        Some(shell.dock),
+                        8,
+                        self.config.dock.auto_hide_delay_ms,
+                        None,
+                    );
+                }
+            }
         }
     }
 
@@ -1379,6 +1549,281 @@ impl App {
         }
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    fn dock_icon_screen_rect(&self, dock: HWND, index: usize) -> Option<RECT> {
+        let hide_progress = self
+            .auto_hide
+            .get(&(dock.0 as isize))
+            .map_or(0.0, |state| state.progress);
+        self.dock_icon_screen_rect_at_hide_progress(dock, index, hide_progress)
+    }
+
+    fn dock_icon_screen_rect_at_hide_progress(
+        &self,
+        dock: HWND,
+        index: usize,
+        hide_progress: f32,
+    ) -> Option<RECT> {
+        let geometry = self.dock_interaction_geometry(dock)?;
+        let icon = crate::render::dock_icon_rect(
+            geometry.width,
+            geometry.height,
+            geometry.count,
+            geometry.icon_size,
+            self.cursor_x.get(&(dock.0 as isize)).copied(),
+            geometry.magnification,
+            geometry.separator,
+            hide_progress,
+            index,
+        )?;
+        let mut dock_rect = RECT::default();
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(dock, &mut dock_rect).ok()?;
+        }
+        Some(RECT {
+            left: dock_rect.left + (icon.left * geometry.scale).round() as i32,
+            top: dock_rect.top + (icon.top * geometry.scale).round() as i32,
+            right: dock_rect.left + (icon.right * geometry.scale).round() as i32,
+            bottom: dock_rect.top + (icon.bottom * geometry.scale).round() as i32,
+        })
+    }
+
+    fn start_window_open_animation(
+        &mut self,
+        dock: HWND,
+        source: HWND,
+        origin_screen: RECT,
+        minimize_source: bool,
+    ) {
+        self.start_window_transition(dock, source, origin_screen, minimize_source, true);
+    }
+
+    fn start_window_minimize_animation(&mut self, dock: HWND, source: HWND, origin_screen: RECT) {
+        self.start_window_transition(dock, source, origin_screen, true, false);
+    }
+
+    fn handle_native_minimize(&mut self, source: HWND) {
+        if source.is_invalid()
+            || self
+                .window_open_animation
+                .as_ref()
+                .is_some_and(|animation| animation.source == source)
+        {
+            return;
+        }
+        let docks: Vec<_> = self.shells.iter().map(|shell| shell.dock).collect();
+        let target = docks.into_iter().find_map(|dock| {
+            let items = self.dock_items(dock);
+            items
+                .iter()
+                .position(|item| {
+                    matches!(item, DockItem::Application { windows, .. } if windows.contains(&source))
+                })
+                .map(|index| (dock, index))
+        });
+        let Some((dock, index)) = target else {
+            return;
+        };
+        let Some(origin) = self.dock_icon_screen_rect_at_hide_progress(dock, index, 0.0) else {
+            return;
+        };
+        self.start_window_minimize_animation(dock, source, origin);
+    }
+
+    fn reveal_dock_for_transition(&mut self, dock: HWND) {
+        if !self.config.dock.auto_hide {
+            return;
+        }
+        if let Some(state) = self.auto_hide.get_mut(&(dock.0 as isize)) {
+            state.progress = 0.0;
+            state.target = 0.0;
+            state.last_tick = Instant::now();
+        }
+        unsafe {
+            let _ = KillTimer(Some(dock), 7);
+            let _ = KillTimer(Some(dock), 8);
+            let _ = InvalidateRect(Some(dock), None, false);
+        }
+        self.paint(dock);
+    }
+
+    fn start_window_transition(
+        &mut self,
+        dock: HWND,
+        source: HWND,
+        origin_screen: RECT,
+        _minimize_source: bool,
+        opening: bool,
+    ) {
+        self.close_window_open_animation(false);
+        let was_minimized = unsafe { IsIconic(source).as_bool() };
+        if self.config.behavior.reduce_motion {
+            settle_window_transition(source, opening, was_minimized);
+            return;
+        }
+
+        let mut target_screen = RECT::default();
+        let got_target = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(source, &mut target_screen)
+                .is_ok()
+        };
+        if was_minimized
+            || !got_target
+            || rect_width(target_screen) < 120
+            || rect_height(target_screen) < 80
+        {
+            let mut placement = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetWindowPlacement(source, &mut placement).is_ok() } {
+                target_screen = placement.rcNormalPosition;
+            }
+        }
+        if rect_width(target_screen) < 120 || rect_height(target_screen) < 80 {
+            settle_window_transition(source, opening, was_minimized);
+            return;
+        }
+
+        let source_size = SIZE {
+            cx: rect_width(target_screen),
+            cy: rect_height(target_screen),
+        };
+        let icon_rect = launch_origin_rect(origin_screen, source_size);
+        let overlay_bounds = RECT {
+            left: target_screen.left.min(icon_rect.left) - 2,
+            top: target_screen.top.min(icon_rect.top) - 2,
+            right: target_screen.right.max(icon_rect.right) + 2,
+            bottom: target_screen.bottom.max(icon_rect.bottom) + 2,
+        };
+        let Ok(overlay) = create_window(
+            overlay_bounds.left,
+            overlay_bounds.top,
+            rect_width(overlay_bounds),
+            rect_height(overlay_bounds),
+            false,
+        ) else {
+            settle_window_transition(source, opening, was_minimized);
+            return;
+        };
+        configure_window_backdrop(overlay, false, self.high_contrast);
+        self.kinds
+            .insert(overlay.0 as isize, WindowKind::LaunchOverlay);
+
+        if self
+            .renderer
+            .prepare_genie_snapshot(
+                overlay,
+                source,
+                source_size.cx,
+                source_size.cy,
+                was_minimized,
+            )
+            .is_err()
+        {
+            self.kinds.remove(&(overlay.0 as isize));
+            self.renderer.forget(overlay);
+            unsafe {
+                let _ = DestroyWindow(overlay);
+            }
+            settle_window_transition(source, opening, was_minimized);
+            return;
+        }
+
+        // Capture while an auto-hidden Dock is still off-screen, then reveal it.
+        // Otherwise the Dock itself would be baked into the app snapshot.
+        self.reveal_dock_for_transition(dock);
+
+        let destinations =
+            genie_frame_rects(target_screen, icon_rect, overlay_bounds, 0.0, opening);
+        if self
+            .renderer
+            .paint_genie(overlay, &destinations, 1.0)
+            .is_err()
+        {
+            self.kinds.remove(&(overlay.0 as isize));
+            self.renderer.forget(overlay);
+            unsafe {
+                let _ = DestroyWindow(overlay);
+            }
+            settle_window_transition(source, opening, was_minimized);
+            return;
+        }
+
+        unsafe {
+            let _ = ShowWindow(overlay, SW_SHOWNA);
+            if !was_minimized {
+                let _ = ShowWindow(source, SW_MINIMIZE);
+            }
+            self.window_open_animation = Some(WindowOpenAnimation {
+                dock,
+                overlay,
+                source,
+                window_rect: target_screen,
+                icon_rect,
+                overlay_bounds,
+                started: Instant::now(),
+                restore_at_end: opening,
+                opening,
+            });
+            // Submit faster than the compositor refresh so DWM always has a fresh frame.
+            SetTimer(Some(overlay), 11, 8, None);
+        }
+    }
+
+    fn animate_window_open(&mut self, hwnd: HWND) {
+        let Some(animation) = self
+            .window_open_animation
+            .as_ref()
+            .filter(|animation| animation.overlay == hwnd)
+        else {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), 11);
+            }
+            return;
+        };
+        let duration = if animation.opening { 0.20 } else { 0.16 };
+        let progress = (animation.started.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
+        let destinations = genie_frame_rects(
+            animation.window_rect,
+            animation.icon_rect,
+            animation.overlay_bounds,
+            progress,
+            animation.opening,
+        );
+        let painted = self.renderer.paint_genie(hwnd, &destinations, 1.0).is_ok();
+        if progress >= 1.0 || !painted {
+            self.close_window_open_animation(animation.opening);
+        }
+    }
+
+    fn close_window_open_animation(&mut self, focus_source: bool) {
+        let Some(animation) = self.window_open_animation.take() else {
+            return;
+        };
+        unsafe {
+            if animation.restore_at_end {
+                let _ = ShowWindow(animation.source, SW_RESTORE);
+            }
+            if focus_source && animation.opening {
+                let _ = SetForegroundWindow(animation.source);
+            }
+            let _ = KillTimer(Some(animation.overlay), 11);
+            if self.config.dock.auto_hide {
+                SetTimer(
+                    Some(animation.dock),
+                    8,
+                    self.config.dock.auto_hide_delay_ms,
+                    None,
+                );
+            }
+        }
+        self.kinds.remove(&(animation.overlay.0 as isize));
+        self.renderer.forget(animation.overlay);
+        unsafe {
+            let _ = DestroyWindow(animation.overlay);
         }
     }
 
@@ -1480,17 +1925,6 @@ impl App {
         }
     }
 
-    fn schedule_preview(&mut self, dock: HWND, source: Option<HWND>) {
-        self.close_preview();
-        self.preview_candidate = source.map(|source| (dock, source));
-        unsafe {
-            let _ = KillTimer(Some(dock), 6);
-            if source.is_some() {
-                SetTimer(Some(dock), 6, 450, None);
-            }
-        }
-    }
-
     fn cancel_preview_candidate(&mut self, dock: HWND) {
         self.preview_candidate = None;
         unsafe {
@@ -1540,28 +1974,82 @@ impl App {
         if !keep_stack {
             self.close_folder_stack();
         }
-        if let DockItem::Application { windows, .. } = item
-            && (new_instance || windows.is_empty())
-        {
-            self.start_launch_bounce(hwnd, index, dock_label(item), windows.is_empty());
-        }
         match item {
             DockItem::Application { windows, .. } if !new_instance && !windows.is_empty() => {
+                let foreground = unsafe { GetForegroundWindow() };
+                let foreground_root = unsafe { GetAncestor(foreground, GA_ROOTOWNER) };
+                let active_window = windows
+                    .iter()
+                    .copied()
+                    .find(|window| *window == foreground || *window == foreground_root);
+                if let Some(active_window) = active_window {
+                    self.close_window_open_animation(false);
+                    if let Some(origin) = self.dock_icon_screen_rect(hwnd, index) {
+                        self.start_window_minimize_animation(hwnd, active_window, origin);
+                    } else {
+                        unsafe {
+                            let _ = ShowWindow(active_window, SW_MINIMIZE);
+                        }
+                    }
+                    return;
+                }
                 let key = dock_label(item).to_lowercase();
-                let index = self.cycle_index.entry(key).or_default();
-                let target = windows[*index % windows.len()];
-                *index = (*index + 1) % windows.len();
-                unsafe {
-                    let _ = ShowWindow(target, SW_RESTORE);
-                    let _ = SetForegroundWindow(target);
+                let cycle = self.cycle_index.entry(key).or_default();
+                let target = windows[*cycle % windows.len()];
+                *cycle = (*cycle + 1) % windows.len();
+                if let Some(key) = dock_identity_key(item) {
+                    self.start_launch_bounce(hwnd, index, key, false);
+                }
+                if let Some(origin) = self.dock_icon_screen_rect(hwnd, index) {
+                    self.start_window_open_animation(hwnd, target, origin, false);
+                } else {
+                    unsafe {
+                        let _ = ShowWindow(target, SW_RESTORE);
+                        let _ = SetForegroundWindow(target);
+                    }
                 }
             }
-            DockItem::Application { pin: Some(pin), .. } => launch_path(&pin.path),
+            DockItem::Application {
+                pin: Some(pin),
+                windows,
+                ..
+            } => {
+                if let Some(key) = dock_identity_key(item) {
+                    let wait_for_window = windows.is_empty();
+                    self.start_launch_bounce(hwnd, index, key.clone(), wait_for_window);
+                    if wait_for_window && let Some(origin) = self.dock_icon_screen_rect(hwnd, index)
+                    {
+                        self.pending_window_open = Some(PendingWindowOpen {
+                            dock: hwnd,
+                            key,
+                            origin,
+                            started: Instant::now(),
+                        });
+                    }
+                }
+                launch_path(&pin.path);
+            }
             DockItem::Folder(pin) => self.show_folder_stack(hwnd, pin),
             DockItem::Application {
                 identity: Some(identity),
+                windows,
                 ..
-            } => launch_path(&identity.executable),
+            } => {
+                if let Some(key) = dock_identity_key(item) {
+                    let wait_for_window = windows.is_empty();
+                    self.start_launch_bounce(hwnd, index, key.clone(), wait_for_window);
+                    if wait_for_window && let Some(origin) = self.dock_icon_screen_rect(hwnd, index)
+                    {
+                        self.pending_window_open = Some(PendingWindowOpen {
+                            dock: hwnd,
+                            key,
+                            origin,
+                            started: Instant::now(),
+                        });
+                    }
+                }
+                launch_path(&identity.executable);
+            }
             DockItem::RecycleBin => unsafe {
                 ShellExecuteW(
                     None,
@@ -1621,6 +2109,9 @@ impl App {
                 .cloned()
         {
             reordered = swap_compatible_pins(&mut self.config.pins, &drag.pin, &target_pin);
+        }
+        if reordered {
+            self.rebuild_dock_cache();
         }
         if reordered
             && !self.config.behavior.reduce_motion
@@ -1693,14 +2184,12 @@ impl App {
                     .flatten()
                     .and_then(TopBarSegment::decode);
                 match segment {
-                    Some(TopBarSegment::Network) => {
-                        self.handle_command(CMD_NETWORK_SETTINGS)
-                    }
-                    Some(TopBarSegment::Volume) => self.handle_command(CMD_SOUND_SETTINGS),
-                    Some(TopBarSegment::Battery) => {
-                        self.handle_command(CMD_POWER_SETTINGS)
-                    }
-                    Some(TopBarSegment::Clock) => self.handle_command(CMD_DATE_MENU),
+                    Some(TopBarSegment::Logo) => self.handle_command(CMD_START_MENU),
+                    Some(TopBarSegment::App) => self.show_top_menu(hwnd),
+                    Some(
+                        TopBarSegment::Network | TopBarSegment::Volume | TopBarSegment::Battery,
+                    ) => self.handle_command(CMD_QUICK_SETTINGS),
+                    Some(TopBarSegment::Clock) => self.handle_command(CMD_NOTIFICATION_CENTER),
                     _ => self.show_top_menu(hwnd),
                 }
             }
@@ -1763,7 +2252,9 @@ impl App {
             return;
         }
         unsafe {
-            let menu = CreatePopupMenu().expect("menu");
+            let Ok(menu) = CreatePopupMenu() else {
+                return;
+            };
             let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, w!("Open settings file"));
             let _ = AppendMenuW(
                 menu,
@@ -1810,6 +2301,51 @@ impl App {
                 w!("Start with Windows"),
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING
+                    | if self.config.top_bar.show_network {
+                        MF_CHECKED
+                    } else {
+                        Default::default()
+                    },
+                CMD_SHOW_NETWORK,
+                w!("Show network"),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING
+                    | if self.config.top_bar.show_volume {
+                        MF_CHECKED
+                    } else {
+                        Default::default()
+                    },
+                CMD_SHOW_VOLUME,
+                w!("Show volume"),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING
+                    | if self.config.top_bar.show_battery {
+                        MF_CHECKED
+                    } else {
+                        Default::default()
+                    },
+                CMD_SHOW_BATTERY,
+                w!("Show battery"),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING
+                    | if self.config.top_bar.use_24_hour_clock {
+                        MF_CHECKED
+                    } else {
+                        Default::default()
+                    },
+                CMD_CLOCK_24_HOUR,
+                w!("Use 24-hour clock"),
+            );
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_ICON_LARGER, w!("Larger icons"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_ICON_SMALLER, w!("Smaller icons"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -1830,7 +2366,18 @@ impl App {
 
     fn show_top_menu(&mut self, hwnd: HWND) {
         unsafe {
-            let menu = CreatePopupMenu().expect("menu");
+            let Ok(menu) = CreatePopupMenu() else {
+                return;
+            };
+            let _ = AppendMenuW(menu, MF_STRING, CMD_START_MENU, w!("Start"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_QUICK_SETTINGS, w!("Quick Settings"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                CMD_NOTIFICATION_CENTER,
+                w!("Notifications & calendar"),
+            );
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
@@ -1883,7 +2430,9 @@ impl App {
     fn show_item_menu(&mut self, hwnd: HWND, item: DockItem) {
         self.menu_item = Some(item.clone());
         unsafe {
-            let menu = CreatePopupMenu().expect("menu");
+            let Ok(menu) = CreatePopupMenu() else {
+                return;
+            };
             let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_ITEM, w!("Open"));
             if matches!(item, DockItem::Application { .. }) {
                 let _ = AppendMenuW(menu, MF_STRING, CMD_NEW_INSTANCE, w!("New instance"));
@@ -1917,13 +2466,29 @@ impl App {
 
     fn handle_command(&mut self, command: usize) {
         match command {
+            CMD_START_MENU => open_start_menu(),
+            CMD_QUICK_SETTINGS => send_windows_shortcut(b'A'),
+            CMD_NOTIFICATION_CENTER => send_windows_shortcut(b'N'),
+            CMD_CLOCK_24_HOUR => {
+                self.config.top_bar.use_24_hour_clock = !self.config.top_bar.use_24_hour_clock
+            }
+            CMD_SHOW_NETWORK => {
+                self.config.top_bar.show_network = !self.config.top_bar.show_network
+            }
+            CMD_SHOW_VOLUME => self.config.top_bar.show_volume = !self.config.top_bar.show_volume,
+            CMD_SHOW_BATTERY => {
+                self.config.top_bar.show_battery = !self.config.top_bar.show_battery
+            }
             CMD_SETTINGS => {
                 if let Ok(path) = crate::config::app_data_dir().map(|p| p.join("config.json")) {
                     launch_path(&path);
                 }
             }
             CMD_REDUCE_MOTION => {
-                self.config.behavior.reduce_motion = !self.config.behavior.reduce_motion
+                self.config.behavior.reduce_motion = !self.config.behavior.reduce_motion;
+                if self.config.behavior.reduce_motion {
+                    self.cancel_launch_feedback();
+                }
             }
             CMD_AUTO_HIDE => {
                 self.config.dock.auto_hide = !self.config.dock.auto_hide;
@@ -2064,6 +2629,7 @@ impl App {
         for shell in &self.shells {
             unsafe {
                 let _ = InvalidateRect(Some(shell.dock), None, false);
+                let _ = InvalidateRect(Some(shell.top), None, false);
             }
         }
     }
@@ -2320,6 +2886,11 @@ unsafe extern "system" fn window_proc(
     }
     match msg {
         WM_NCHITTEST => {
+            if with_app_value(false, |app| {
+                app.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::LaunchOverlay)
+            }) {
+                return LRESULT(HTTRANSPARENT as isize);
+            }
             let screen_x = (lparam.0 as i16) as i32;
             let screen_y = ((lparam.0 >> 16) as i16) as i32;
             if let Some(hit) =
@@ -2384,6 +2955,10 @@ unsafe extern "system" fn window_proc(
             with_app(|app| app.drop_files(HDROP(wparam.0 as *mut _)));
             return LRESULT(0);
         }
+        WM_TIMER if wparam.0 == 1 => {
+            with_app(|app| app.refresh_system_status());
+            return LRESULT(0);
+        }
         WM_TIMER if wparam.0 == 2 => {
             with_app(|app| app.animate(hwnd));
             return LRESULT(0);
@@ -2418,6 +2993,14 @@ unsafe extern "system" fn window_proc(
         }
         WM_TIMER if wparam.0 == 10 => {
             with_app(|app| app.close_folder_stack());
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == 11 => {
+            with_app(|app| app.animate_window_open(hwnd));
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == 12 => {
+            with_app(|app| app.cache_foreground_for_genie());
             return LRESULT(0);
         }
         WM_TIMER => {
@@ -2505,6 +3088,43 @@ fn dock_label(item: &DockItem) -> String {
         } => friendly_app_name(&identity.display_name),
         DockItem::Application { .. } => "App".into(),
         DockItem::RecycleBin => "Recycle Bin".into(),
+    }
+}
+
+#[derive(Clone)]
+struct PendingWindowOpen {
+    dock: HWND,
+    key: String,
+    origin: RECT,
+    started: Instant,
+}
+
+struct WindowOpenAnimation {
+    dock: HWND,
+    overlay: HWND,
+    source: HWND,
+    window_rect: RECT,
+    icon_rect: RECT,
+    overlay_bounds: RECT,
+    started: Instant,
+    restore_at_end: bool,
+    opening: bool,
+}
+
+fn dock_identity_key(item: &DockItem) -> Option<String> {
+    match item {
+        DockItem::Application { pin: Some(pin), .. } => Some(
+            pin.identity_path
+                .as_ref()
+                .unwrap_or(&pin.path)
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+        ),
+        DockItem::Application {
+            identity: Some(identity),
+            ..
+        } => Some(identity.icon_key.to_ascii_lowercase()),
+        _ => None,
     }
 }
 
@@ -2612,17 +3232,26 @@ fn preferred_pin_icon(pin: &crate::config::PinConfig) -> std::path::PathBuf {
     }
 }
 
-fn first_window(item: &DockItem) -> Option<HWND> {
-    match item {
-        DockItem::Application { windows, .. } => windows.first().copied(),
-        _ => None,
-    }
-}
-
 fn send_media_key(key: u8) {
     unsafe {
         keybd_event(key, 0, Default::default(), 0);
         keybd_event(key, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
+fn open_start_menu() {
+    unsafe {
+        keybd_event(VK_LWIN.0 as u8, 0, Default::default(), 0);
+        keybd_event(VK_LWIN.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
+fn send_windows_shortcut(key: u8) {
+    unsafe {
+        keybd_event(VK_LWIN.0 as u8, 0, Default::default(), 0);
+        keybd_event(key, 0, Default::default(), 0);
+        keybd_event(key, 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(VK_LWIN.0 as u8, 0, KEYEVENTF_KEYUP, 0);
     }
 }
 
@@ -2737,6 +3366,122 @@ struct LaunchBounceFrame {
     scale_y: f32,
 }
 
+fn rect_width(rect: RECT) -> i32 {
+    rect.right - rect.left
+}
+
+fn rect_height(rect: RECT) -> i32 {
+    rect.bottom - rect.top
+}
+
+fn launch_origin_rect(icon: RECT, source: SIZE) -> RECT {
+    let icon_width = rect_width(icon).max(1) as f32;
+    let icon_height = rect_height(icon).max(1) as f32;
+    let aspect = source.cx.max(1) as f32 / source.cy.max(1) as f32;
+    let (width, height) = if aspect >= 1.0 {
+        (icon_width, icon_width / aspect)
+    } else {
+        (icon_height * aspect, icon_height)
+    };
+    let center_x = (icon.left + icon.right) as f32 / 2.0;
+    let center_y = (icon.top + icon.bottom) as f32 / 2.0;
+    RECT {
+        left: (center_x - width / 2.0).round() as i32,
+        top: (center_y - height / 2.0).round() as i32,
+        right: (center_x + width / 2.0).round() as i32,
+        bottom: (center_y + height / 2.0).round() as i32,
+    }
+}
+
+fn settle_window_transition(source: HWND, opening: bool, was_minimized: bool) {
+    unsafe {
+        if opening {
+            if was_minimized {
+                let _ = ShowWindow(source, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(source);
+        } else {
+            let _ = ShowWindow(source, SW_MINIMIZE);
+        }
+    }
+}
+
+fn genie_frame_rects(
+    window: RECT,
+    icon: RECT,
+    overlay: RECT,
+    progress: f32,
+    opening: bool,
+) -> Vec<RECT> {
+    (0..GENIE_SLICES)
+        .map(|index| {
+            let screen = genie_slice_rect(window, icon, progress, index, opening);
+            RECT {
+                left: screen.left - overlay.left,
+                top: screen.top - overlay.top,
+                right: screen.right - overlay.left,
+                bottom: screen.bottom - overlay.top,
+            }
+        })
+        .collect()
+}
+
+fn genie_slice_rect(window: RECT, icon: RECT, progress: f32, index: usize, opening: bool) -> RECT {
+    let y0 = index as f32 / GENIE_SLICES as f32;
+    let y1 = (index + 1) as f32 / GENIE_SLICES as f32;
+    let ym = (y0 + y1) / 2.0;
+    let local = |y: f32| {
+        let stagger = 0.22;
+        let raw = if opening {
+            progress * (1.0 + stagger) - y * stagger
+        } else {
+            progress * (1.0 + stagger) - (1.0 - y) * stagger
+        }
+        .clamp(0.0, 1.0);
+        1.0 - (1.0 - raw).powi(3)
+    };
+    let interpolate = |from: f32, to: f32, amount: f32| from + (to - from) * amount;
+    let icon_y = |y: f32| icon.top as f32 + rect_height(icon) as f32 * y;
+    let window_y = |y: f32| window.top as f32 + rect_height(window) as f32 * y;
+    let boundary_y = |y: f32| {
+        if opening {
+            interpolate(icon_y(y), window_y(y), local(y))
+        } else {
+            interpolate(window_y(y), icon_y(y), local(y))
+        }
+    };
+    let horizontal_progress = local(ym);
+    let icon_center = (icon.left + icon.right) as f32 / 2.0;
+    let window_center = (window.left + window.right) as f32 / 2.0;
+    let (center, width) = if opening {
+        (
+            interpolate(icon_center, window_center, horizontal_progress),
+            interpolate(
+                rect_width(icon) as f32,
+                rect_width(window) as f32,
+                horizontal_progress,
+            ),
+        )
+    } else {
+        (
+            interpolate(window_center, icon_center, horizontal_progress),
+            interpolate(
+                rect_width(window) as f32,
+                rect_width(icon) as f32,
+                horizontal_progress,
+            ),
+        )
+    };
+    let top = boundary_y(y0).round() as i32;
+    let bottom = boundary_y(y1).round() as i32;
+    RECT {
+        left: (center - width / 2.0).round() as i32,
+        top,
+        right: (center + width / 2.0).round() as i32,
+        bottom,
+    }
+}
+
 fn launch_bounce_frame(elapsed: Duration, icon_size: f32) -> LaunchBounceFrame {
     let cycle = (elapsed.as_secs_f32() % 0.62) / 0.62;
     if cycle < 0.82 {
@@ -2818,6 +3563,7 @@ fn configure_window_backdrop(hwnd: HWND, rounded: bool, high_contrast: bool) {
     } else {
         DWMWCP_DONOTROUND
     };
+    let border_color = DWMWA_COLOR_NONE;
     unsafe {
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -2830,6 +3576,12 @@ fn configure_window_backdrop(hwnd: HWND, rounded: bool, high_contrast: bool) {
             DWMWA_WINDOW_CORNER_PREFERENCE,
             (&corner as *const windows::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE).cast(),
             std::mem::size_of_val(&corner) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&border_color as *const u32).cast(),
+            std::mem::size_of_val(&border_color) as u32,
         );
     }
 }
@@ -2876,10 +3628,12 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(test)]
 mod label_tests {
     use super::{
-        PinConfig, PinKind, SIZE, approach_value, ease_out_quart, friendly_app_name,
-        launch_bounce_frame, preview_content_rect, rounded_rect_contains, scale_i32,
-        swap_compatible_pins,
+        DockItem, GENIE_SLICES, PinConfig, PinKind, RECT, SIZE, approach_value, dock_identity_key,
+        ease_out_quart, friendly_app_name, genie_frame_rects, genie_slice_rect,
+        launch_bounce_frame, launch_origin_rect, preview_content_rect, rect_width,
+        rounded_rect_contains, scale_i32, swap_compatible_pins,
     };
+    use crate::model::AppIdentity;
     use std::{path::PathBuf, time::Duration};
 
     fn pin(label: &str, kind: PinKind) -> PinConfig {
@@ -2915,6 +3669,116 @@ mod label_tests {
         let landing = launch_bounce_frame(Duration::from_millis(565), 48.0);
         assert!(landing.scale_y < 0.95);
         assert!(landing.scale_x > 1.03);
+    }
+
+    #[test]
+    fn genie_open_starts_at_icon_and_unfurls_to_window() {
+        let icon_bounds = RECT {
+            left: 400,
+            top: 900,
+            right: 464,
+            bottom: 964,
+        };
+        let icon = launch_origin_rect(icon_bounds, SIZE { cx: 1600, cy: 900 });
+        let window = RECT {
+            left: 120,
+            top: 80,
+            right: 1720,
+            bottom: 980,
+        };
+        let start_top = genie_slice_rect(window, icon, 0.0, 0, true);
+        let start_bottom = genie_slice_rect(window, icon, 0.0, GENIE_SLICES - 1, true);
+        assert_eq!(start_top.top, icon.top);
+        assert_eq!(start_bottom.bottom, icon.bottom);
+        let end_top = genie_slice_rect(window, icon, 1.0, 0, true);
+        let end_bottom = genie_slice_rect(window, icon, 1.0, GENIE_SLICES - 1, true);
+        assert_eq!(end_top.top, window.top);
+        assert_eq!(end_bottom.bottom, window.bottom);
+        let middle_top = genie_slice_rect(window, icon, 0.35, 0, true);
+        let middle_bottom = genie_slice_rect(window, icon, 0.35, GENIE_SLICES - 1, true);
+        assert!(rect_width(middle_top) > rect_width(middle_bottom));
+    }
+
+    #[test]
+    fn genie_minimize_funnels_window_back_to_icon() {
+        let window = RECT {
+            left: 120,
+            top: 80,
+            right: 1720,
+            bottom: 980,
+        };
+        let icon = RECT {
+            left: 400,
+            top: 925,
+            right: 464,
+            bottom: 961,
+        };
+        let start_top = genie_slice_rect(window, icon, 0.0, 0, false);
+        let start_bottom = genie_slice_rect(window, icon, 0.0, GENIE_SLICES - 1, false);
+        assert_eq!(start_top.top, window.top);
+        assert_eq!(start_bottom.bottom, window.bottom);
+        let end_top = genie_slice_rect(window, icon, 1.0, 0, false);
+        let end_bottom = genie_slice_rect(window, icon, 1.0, GENIE_SLICES - 1, false);
+        assert_eq!(end_top.top, icon.top);
+        assert_eq!(end_bottom.bottom, icon.bottom);
+        let middle_top = genie_slice_rect(window, icon, 0.35, 0, false);
+        let middle_bottom = genie_slice_rect(window, icon, 0.35, GENIE_SLICES - 1, false);
+        assert!(rect_width(middle_bottom) < rect_width(middle_top));
+    }
+
+    #[test]
+    fn genie_frame_is_contiguous_and_local_to_one_overlay() {
+        let window = RECT {
+            left: 100,
+            top: 50,
+            right: 1700,
+            bottom: 950,
+        };
+        let icon = RECT {
+            left: 760,
+            top: 930,
+            right: 824,
+            bottom: 966,
+        };
+        let overlay = RECT {
+            left: 98,
+            top: 48,
+            right: 1702,
+            bottom: 968,
+        };
+        let slices = genie_frame_rects(window, icon, overlay, 0.42, false);
+        assert_eq!(slices.len(), GENIE_SLICES);
+        assert!(slices.iter().all(|slice| {
+            slice.left >= 0
+                && slice.top >= 0
+                && slice.right <= rect_width(overlay)
+                && slice.bottom <= super::rect_height(overlay)
+        }));
+        for pair in slices.windows(2) {
+            assert_eq!(pair[0].bottom, pair[1].top);
+        }
+    }
+
+    #[test]
+    fn launch_identity_stays_stable_when_a_pinned_app_gets_a_window() {
+        let mut app_pin = pin("Example", PinKind::Application);
+        app_pin.identity_path = Some(PathBuf::from(r"C:\Apps\Example.exe"));
+        let before = DockItem::Application {
+            pin: Some(app_pin.clone()),
+            identity: None,
+            windows: Vec::new(),
+        };
+        let after = DockItem::Application {
+            pin: Some(app_pin),
+            identity: Some(AppIdentity {
+                app_user_model_id: None,
+                executable: PathBuf::from(r"C:\Apps\Example.exe"),
+                display_name: "Different window title".into(),
+                icon_key: "example.exe".into(),
+            }),
+            windows: Vec::new(),
+        };
+        assert_eq!(dock_identity_key(&before), dock_identity_key(&after));
     }
 
     #[test]

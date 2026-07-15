@@ -42,6 +42,7 @@ pub struct BehaviorConfig {
     pub start_with_windows: bool,
     pub reduce_motion: bool,
     pub reserve_edges: bool,
+    pub taskbar_pins_imported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,6 +110,7 @@ impl Default for BehaviorConfig {
             start_with_windows: false,
             reduce_motion: false,
             reserve_edges: true,
+            taskbar_pins_imported: false,
         }
     }
 }
@@ -117,10 +119,11 @@ impl ConfigV1 {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
         if !path.exists() {
-            let config = Self {
+            let mut config = Self {
                 pins: import_taskbar_pins(),
                 ..Self::default()
             };
+            config.behavior.taskbar_pins_imported = true;
             config.save()?;
             return Ok(config);
         }
@@ -136,7 +139,15 @@ impl ConfigV1 {
                 pin.identity_path = resolve_shortcut(&pin.path);
             }
         }
+        let migrated_pins = !config.behavior.taskbar_pins_imported;
+        if migrated_pins {
+            merge_imported_pins(&mut config.pins, import_taskbar_pins());
+            config.behavior.taskbar_pins_imported = true;
+        }
         config.validate();
+        if migrated_pins {
+            config.save()?;
+        }
         Ok(config)
     }
 
@@ -208,6 +219,48 @@ fn import_taskbar_pins() -> Vec<PinConfig> {
     pins
 }
 
+fn merge_imported_pins(existing: &mut Vec<PinConfig>, imported: Vec<PinConfig>) {
+    let recycle = existing
+        .iter()
+        .position(|pin| pin.kind == PinKind::RecycleBin)
+        .map(|index| existing.remove(index));
+    for pin in imported
+        .into_iter()
+        .filter(|pin| pin.kind != PinKind::RecycleBin)
+    {
+        if !existing.iter().any(|current| same_pin(current, &pin)) {
+            existing.push(pin);
+        }
+    }
+    existing.push(recycle.unwrap_or(PinConfig {
+        label: "Recycle Bin".into(),
+        path: PathBuf::new(),
+        identity_path: None,
+        kind: PinKind::RecycleBin,
+    }));
+}
+
+fn same_pin(left: &PinConfig, right: &PinConfig) -> bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    if left.kind == PinKind::RecycleBin {
+        return true;
+    }
+    paths_equal(&left.path, &right.path)
+        || left.identity_path.as_ref().is_some_and(|left_identity| {
+            right
+                .identity_path
+                .as_ref()
+                .is_some_and(|right_identity| paths_equal(left_identity, right_identity))
+        })
+}
+
+fn paths_equal(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
 pub(crate) fn resolve_shortcut(path: &std::path::Path) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStrExt;
     use windows::{
@@ -260,5 +313,48 @@ mod tests {
         assert_eq!(c.dock.opacity, 0.35);
         assert_eq!(c.dock.auto_hide_delay_ms, 100);
         assert_eq!(c.top_bar.height, 26);
+    }
+
+    #[test]
+    fn taskbar_import_merges_apps_without_duplicates_and_keeps_recycle_last() {
+        let mut existing = vec![PinConfig {
+            label: "Example".into(),
+            path: PathBuf::from(r"C:\Pins\Example.lnk"),
+            identity_path: Some(PathBuf::from(r"C:\Apps\Example.exe")),
+            kind: PinKind::Application,
+        }];
+        let imported = vec![
+            PinConfig {
+                label: "Example duplicate".into(),
+                path: PathBuf::from(r"C:\Other\Example.lnk"),
+                identity_path: Some(PathBuf::from(r"c:\apps\example.exe")),
+                kind: PinKind::Application,
+            },
+            PinConfig {
+                label: "Second".into(),
+                path: PathBuf::from(r"C:\Pins\Second.lnk"),
+                identity_path: Some(PathBuf::from(r"C:\Apps\Second.exe")),
+                kind: PinKind::Application,
+            },
+            PinConfig {
+                label: "Recycle Bin".into(),
+                path: PathBuf::new(),
+                identity_path: None,
+                kind: PinKind::RecycleBin,
+            },
+        ];
+
+        merge_imported_pins(&mut existing, imported);
+
+        assert_eq!(existing.len(), 3);
+        assert_eq!(existing[0].label, "Example");
+        assert_eq!(existing[1].label, "Second");
+        assert_eq!(existing.last().unwrap().kind, PinKind::RecycleBin);
+    }
+
+    #[test]
+    fn old_behavior_config_requests_one_time_pin_migration() {
+        let behavior: BehaviorConfig = serde_json::from_str("{}").unwrap();
+        assert!(!behavior.taskbar_pins_imported);
     }
 }

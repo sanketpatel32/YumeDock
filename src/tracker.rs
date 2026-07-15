@@ -10,7 +10,7 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HWND, LPARAM},
+        Foundation::{CloseHandle, HWND, LPARAM, WPARAM},
         Graphics::{
             Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
             Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow},
@@ -22,11 +22,11 @@ use windows::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             WindowsAndMessaging::{
                 CHILDID_SELF, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
-                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZEEND, EnumWindows, GW_OWNER,
-                GWL_EXSTYLE, GetWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
-                GetWindowThreadProcessId, IsIconic, IsWindowVisible, OBJID_WINDOW,
-                PostThreadMessageW, SW_HIDE, ShowWindow, WINEVENT_OUTOFCONTEXT,
-                WINEVENT_SKIPOWNPROCESS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+                EnumWindows, GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW,
+                GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+                IsWindowVisible, OBJID_WINDOW, PostThreadMessageW, SW_HIDE, ShowWindow,
+                WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
             },
         },
     },
@@ -36,14 +36,23 @@ use windows::{
 static OWN_PID: OnceLock<u32> = OnceLock::new();
 static UI_THREAD: AtomicU32 = AtomicU32::new(0);
 static REFRESH_MESSAGE: AtomicU32 = AtomicU32::new(0);
+static FOREGROUND_MESSAGE: AtomicU32 = AtomicU32::new(0);
+static MINIMIZE_MESSAGE: AtomicU32 = AtomicU32::new(0);
 static REFRESH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub struct HookSet(Vec<HWINEVENTHOOK>);
 
 impl HookSet {
-    pub fn install(thread_id: u32, refresh_message: u32) -> Self {
+    pub fn install(
+        thread_id: u32,
+        refresh_message: u32,
+        foreground_message: u32,
+        minimize_message: u32,
+    ) -> Self {
         UI_THREAD.store(thread_id, Ordering::Relaxed);
         REFRESH_MESSAGE.store(refresh_message, Ordering::Relaxed);
+        FOREGROUND_MESSAGE.store(foreground_message, Ordering::Relaxed);
+        MINIMIZE_MESSAGE.store(minimize_message, Ordering::Relaxed);
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
         let mut hooks = Vec::new();
         unsafe {
@@ -64,6 +73,7 @@ impl HookSet {
                 EVENT_OBJECT_DESTROY,
                 EVENT_OBJECT_SHOW,
                 EVENT_SYSTEM_MOVESIZEEND,
+                EVENT_SYSTEM_MINIMIZESTART,
             ] {
                 let hook = SetWinEventHook(event, event, None, Some(win_event), 0, 0, flags);
                 if !hook.is_invalid() {
@@ -105,6 +115,24 @@ unsafe extern "system" fn win_event(
         return;
     }
     let thread = UI_THREAD.load(Ordering::Relaxed);
+    if event == EVENT_SYSTEM_FOREGROUND {
+        let message = FOREGROUND_MESSAGE.load(Ordering::Relaxed);
+        if thread != 0 && message != 0 {
+            let _ = unsafe {
+                PostThreadMessageW(thread, message, Default::default(), Default::default())
+            };
+        }
+        return;
+    }
+    if event == EVENT_SYSTEM_MINIMIZESTART {
+        let message = MINIMIZE_MESSAGE.load(Ordering::Relaxed);
+        if thread != 0 && message != 0 {
+            let _ = unsafe {
+                PostThreadMessageW(thread, message, WPARAM(hwnd.0 as usize), Default::default())
+            };
+        }
+        return;
+    }
     let message = REFRESH_MESSAGE.load(Ordering::Relaxed);
     if thread != 0
         && message != 0
