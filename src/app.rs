@@ -111,6 +111,10 @@ const CMD_MINIMIZE_ITEM: usize = 203;
 const CMD_CLOSE_ITEM: usize = 204;
 const CMD_EMPTY_RECYCLE: usize = 205;
 const CMD_DEBUG_POPOVER: usize = 300;
+const CMD_POWER_SLEEP: usize = 315;
+const CMD_POWER_RESTART: usize = 316;
+const CMD_POWER_SHUTDOWN: usize = 317;
+const CMD_POWER_LOCK: usize = 318;
 pub const WM_REFRESH: u32 = WM_APP + 1;
 const WM_REBUILD_MONITORS: u32 = WM_APP + 2;
 const WM_FOREGROUND_CHANGED: u32 = WM_APP + 3;
@@ -2611,6 +2615,10 @@ impl App {
                     SW_SHOW,
                 );
             },
+            CMD_POWER_SLEEP => power_action(PowerAction::Sleep),
+            CMD_POWER_RESTART => power_action(PowerAction::Restart),
+            CMD_POWER_SHUTDOWN => power_action(PowerAction::Shutdown),
+            CMD_POWER_LOCK => power_action(PowerAction::Lock),
             CMD_DATE_MENU => unsafe {
                 ShellExecuteW(
                     None,
@@ -3389,6 +3397,65 @@ fn open_start_menu() {
     unsafe {
         keybd_event(VK_LWIN.0 as u8, 0, Default::default(), 0);
         keybd_event(VK_LWIN.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PowerAction {
+    Sleep,
+    Restart,
+    Shutdown,
+    Lock,
+}
+
+/// Best-effort power action via the shell. Uses shutdown.exe / rundll32 so we
+/// avoid linking Win32_System_Shutdown and the SE_SHUTDOWN_NAME privilege
+/// dance — these verbs prompt or act as the current user.
+fn power_action(action: PowerAction) {
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
+    unsafe {
+        match action {
+            PowerAction::Sleep => {
+                let _ = ShellExecuteW(
+                    None,
+                    w!("open"),
+                    w!("rundll32.exe"),
+                    w!("powrprof.dll,SetSuspendState 0,1,0"),
+                    None,
+                    SW_SHOW,
+                );
+            }
+            PowerAction::Restart => {
+                let _ = ShellExecuteW(
+                    None,
+                    w!("open"),
+                    w!("shutdown.exe"),
+                    w!("/r /t 0"),
+                    None,
+                    SW_SHOW,
+                );
+            }
+            PowerAction::Shutdown => {
+                let _ = ShellExecuteW(
+                    None,
+                    w!("open"),
+                    w!("shutdown.exe"),
+                    w!("/s /t 0"),
+                    None,
+                    SW_SHOW,
+                );
+            }
+            PowerAction::Lock => {
+                let _ = ShellExecuteW(
+                    None,
+                    w!("open"),
+                    w!("rundll32.exe"),
+                    w!("user32.dll,LockWorkStation"),
+                    None,
+                    SW_SHOW,
+                );
+            }
+        }
     }
 }
 
