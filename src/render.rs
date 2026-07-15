@@ -631,6 +631,9 @@ impl Renderer {
         height: i32,
         prefer_cached: bool,
     ) -> Result<()> {
+        if self.handle_device_loss_if_needed() {
+            return Ok(());
+        }
         let key = source.0 as isize;
         let cached = prefer_cached
             .then(|| self.genie_cache.get(&key).cloned())
@@ -668,6 +671,9 @@ impl Renderer {
         width: i32,
         height: i32,
     ) -> bool {
+        if self.handle_device_loss_if_needed() {
+            return false;
+        }
         let wic = self.wic.clone();
         let bitmap = {
             let Ok(surface) = self.surface(surface_hwnd) else {
