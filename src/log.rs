@@ -1,7 +1,12 @@
 //! Minimal rotating file log for YumeDock. Writes to
 //! `%LOCALAPPDATA%\YumeDock\yumedock.log`, capped at 512 KB (rotated once
-//! to `.1`). No external dependency; line-buffered and lock-free at the
-//! process level (single-threaded UI thread drives most writes).
+//! to `.1`). No external dependency.
+//!
+//! Intended for rare error paths only — `write()` opens and closes the file
+//! per call. The path is resolved once under a `Mutex`, but the writes
+//! themselves are unsynchronized, so this is safe for the current callers
+//! (both on the single UI thread) and must not be called from worker threads
+//! without adding write-side locking.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
