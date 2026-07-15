@@ -1159,7 +1159,7 @@ impl App {
             let _ = EndPaint(hwnd, &ps);
         }
         if let Err(error) = result {
-            eprintln!("paint failed: {error:#}");
+            crate::yume_err!("paint failed: {error:#}");
         }
     }
 

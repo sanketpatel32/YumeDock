@@ -430,7 +430,7 @@ impl Renderer {
             }
             Err(error) => {
                 // Recreation failed — leave `device_lost` set so we retry next frame.
-                eprintln!("device recreation failed: {error:#}");
+                crate::yume_err!("device recreation failed: {error:#}");
                 false
             }
         }
