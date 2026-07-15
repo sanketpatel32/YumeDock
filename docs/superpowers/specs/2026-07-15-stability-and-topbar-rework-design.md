@@ -1,7 +1,7 @@
 # YumeDock: Stability Hardening + Topbar Rework
 
 **Date:** 2026-07-15
-**Status:** Approved (design phase)
+**Status:** Phase 1 built & committed (manual GUI verification pending). Phases 2–4 not started.
 **Scope:** One cycle, four phases delivered incrementally inside it.
 
 ## Goal
