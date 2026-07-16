@@ -1225,6 +1225,50 @@ impl App {
                 }
                 None => Ok(()),
             },
+            Some(WindowKind::QuickPopover) => match self.quick_popover.as_ref() {
+                Some(qp) => {
+                    let layout = crate::render::quick_popover_geometry(qp.kind);
+                    let (status_text, button_label) = match qp.kind {
+                        crate::render::QuickKind::Volume => {
+                            let pct = self.system_status.volume_percent.unwrap_or(0);
+                            let head = if self.system_status.muted {
+                                "Muted"
+                            } else {
+                                "Volume"
+                            };
+                            (format!("{}: {}%", head, pct), "Sound settings")
+                        }
+                        crate::render::QuickKind::Wifi => {
+                            let head = if self.system_status.network_online {
+                                "Wi-Fi: On"
+                            } else {
+                                "Wi-Fi: Off"
+                            };
+                            (head.to_string(), "Network settings")
+                        }
+                        crate::render::QuickKind::Battery => {
+                            let pct = self.system_status.battery_percent.unwrap_or(0);
+                            let head = if self.system_status.charging {
+                                format!("{}% (charging)", pct)
+                            } else {
+                                format!("Battery: {}%", pct)
+                            };
+                            (head, "Power & battery")
+                        }
+                    };
+                    self.renderer.paint_quick_popover(
+                        hwnd,
+                        qp.kind,
+                        &layout,
+                        &status_text,
+                        button_label,
+                        self.system_status.volume_percent,
+                        self.system_status.muted,
+                        None,
+                    )
+                }
+                None => Ok(()),
+            },
             _ => Ok(()),
         };
         unsafe {
@@ -2976,6 +3020,65 @@ impl App {
         }
     }
 
+    fn quick_popover_click(&mut self, hwnd: HWND, x: i32, y: i32) {
+        let scale = window_scale(hwnd);
+        let xf = x as f32 / scale;
+        let yf = y as f32 / scale;
+        let Some(qp) = self.quick_popover.as_ref() else {
+            return;
+        };
+        let layout = crate::render::quick_popover_geometry(qp.kind);
+        match (qp.kind, crate::render::quick_hit_test(&layout, xf, yf)) {
+            (_, crate::render::QuickHit::Button) => {
+                let cmd = match qp.kind {
+                    crate::render::QuickKind::Volume => CMD_SOUND_SETTINGS,
+                    crate::render::QuickKind::Wifi => CMD_NETWORK_SETTINGS,
+                    crate::render::QuickKind::Battery => CMD_POWER_SETTINGS,
+                };
+                self.close_popover();
+                self.handle_command(cmd);
+            }
+            (crate::render::QuickKind::Volume, crate::render::QuickHit::MuteButton) => {
+                let now_muted = !self.system_status.muted;
+                crate::status::set_mute(now_muted);
+                self.system_status.muted = now_muted;
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            (crate::render::QuickKind::Volume, crate::render::QuickHit::Slider) => {
+                self.set_volume_from_x(hwnd, x);
+            }
+            _ => {}
+        }
+    }
+
+    fn set_volume_from_x(&mut self, hwnd: HWND, screen_x: i32) {
+        let scale = window_scale(hwnd);
+        let x = screen_x as f32 / scale;
+        let layout = crate::render::quick_popover_geometry(crate::render::QuickKind::Volume);
+        let Some(slider) = layout.slider else {
+            return;
+        };
+        let frac = ((x - slider.left) / (slider.right - slider.left)).clamp(0.0, 1.0);
+        let level = (frac * 100.0).round() as u8;
+        crate::status::set_volume(level);
+        self.system_status.volume_percent = Some(level);
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
+    fn quick_popover_drag(&mut self, hwnd: HWND, x: i32) {
+        let is_volume = self
+            .quick_popover
+            .as_ref()
+            .is_some_and(|qp| matches!(qp.kind, crate::render::QuickKind::Volume));
+        if is_volume {
+            self.set_volume_from_x(hwnd, x);
+        }
+    }
+
     fn launcher_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
         let scale = window_scale(hwnd);
         let x = x as f32 / scale;
@@ -3214,7 +3317,9 @@ unsafe extern "system" fn window_proc(
             if with_app_value(false, |app| {
                 matches!(
                     app.kinds.get(&(hwnd.0 as isize)),
-                    Some(WindowKind::DebugPopover) | Some(WindowKind::Launcher)
+                    Some(WindowKind::DebugPopover)
+                        | Some(WindowKind::Launcher)
+                        | Some(WindowKind::QuickPopover)
                 )
             }) {
                 return LRESULT(HTCLIENT as isize);
@@ -3253,6 +3358,19 @@ unsafe extern "system" fn window_proc(
                 let x = (lparam.0 as i16) as i32;
                 let y = ((lparam.0 >> 16) as i16) as i32;
                 with_app(|app| app.launcher_mouse_move(hwnd, x, y));
+                return LRESULT(0);
+            }
+            let is_quick = with_app_value(false, |app| {
+                app.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::QuickPopover)
+            });
+            if is_quick {
+                let dragging = with_app_value(false, |app| {
+                    app.quick_popover.as_ref().is_some_and(|qp| qp.dragging)
+                });
+                if dragging {
+                    let x = (lparam.0 as i16) as i32;
+                    with_app(|app| app.quick_popover_drag(hwnd, x));
+                }
                 return LRESULT(0);
             }
             with_app(|app| {
@@ -3298,10 +3416,41 @@ unsafe extern "system" fn window_proc(
                 with_app(|app| app.launcher_click(hwnd, x, y));
                 return LRESULT(0);
             }
+            let is_quick = with_app_value(false, |app| {
+                app.kinds.get(&(hwnd.0 as isize)) == Some(&WindowKind::QuickPopover)
+            });
+            if is_quick {
+                let x = (lparam.0 as i16) as i32;
+                let y = ((lparam.0 >> 16) as i16) as i32;
+                with_app(|app| {
+                    // Mark dragging if the click landed on the slider.
+                    if let Some(qp) = app.quick_popover.as_mut() {
+                        let scale = window_scale(hwnd);
+                        let layout = crate::render::quick_popover_geometry(qp.kind);
+                        if matches!(
+                            crate::render::quick_hit_test(
+                                &layout,
+                                x as f32 / scale,
+                                y as f32 / scale,
+                            ),
+                            crate::render::QuickHit::Slider
+                        ) {
+                            qp.dragging = true;
+                        }
+                    }
+                    app.quick_popover_click(hwnd, x, y);
+                });
+                return LRESULT(0);
+            }
             with_app(|app| app.mouse_down(hwnd, (lparam.0 as i16) as i32));
             return LRESULT(0);
         }
         WM_LBUTTONUP => {
+            with_app(|app| {
+                if let Some(qp) = app.quick_popover.as_mut() {
+                    qp.dragging = false;
+                }
+            });
             with_app(|app| app.mouse_up(hwnd));
             return LRESULT(0);
         }

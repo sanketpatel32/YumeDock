@@ -1338,6 +1338,112 @@ impl Renderer {
         Ok(())
     }
 
+    /// Render a quick popover. `status_text` is the headline (e.g. "Wi-Fi: On",
+    /// "Volume: 45%", "Battery: 80% (charging)"); `button_label` is the
+    /// deep-link button text. Volume kind draws a slider + mute button.
+    pub fn paint_quick_popover(
+        &mut self,
+        hwnd: HWND,
+        kind: QuickKind,
+        layout: &QuickLayout,
+        status_text: &str,
+        button_label: &str,
+        volume_pct: Option<u8>,
+        muted: bool,
+        hit: Option<QuickHit>,
+    ) -> Result<()> {
+        if self.handle_device_loss_if_needed() {
+            return Ok(());
+        }
+        let body = self.body.clone();
+        let small = self.small.clone();
+        let surface = self.surface(hwnd)?;
+        unsafe {
+            surface.context.BeginDraw();
+            surface.context.Clear(Some(&color(0x0c, 0x0f, 0x14, 0.92)));
+
+            // Headline status text.
+            let status: Vec<u16> = status_text.encode_utf16().collect();
+            body.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            surface.context.DrawText(
+                &status,
+                &body,
+                &D2D_RECT_F {
+                    left: QUICK_PAD,
+                    top: QUICK_PAD,
+                    right: layout.width - QUICK_PAD,
+                    bottom: QUICK_PAD + 28.0,
+                },
+                &surface.foreground,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            if matches!(kind, QuickKind::Volume)
+                && let (Some(slider), Some(pct)) = (layout.slider, volume_pct)
+            {
+                // Track background.
+                surface.context.FillRectangle(&slider, &surface.bar_dim);
+                // Filled portion (raw arithmetic — D2D_RECT_F has no .width()).
+                let fill_w = (slider.right - slider.left) * (pct as f32 / 100.0);
+                surface.context.FillRectangle(
+                    &D2D_RECT_F {
+                        left: slider.left,
+                        top: slider.top,
+                        right: slider.left + fill_w,
+                        bottom: slider.bottom,
+                    },
+                    &surface.foreground,
+                );
+                // Mute button.
+                if let Some(mr) = layout.mute_button {
+                    if hit == Some(QuickHit::MuteButton) {
+                        surface.context.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT { rect: mr, radiusX: 6.0, radiusY: 6.0 },
+                            &surface.bar_pill_fill,
+                        );
+                    }
+                    let label = if muted { "Muted" } else { "Audible" };
+                    let t: Vec<u16> = label.encode_utf16().collect();
+                    small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+                    surface.context.DrawText(
+                        &t,
+                        &small,
+                        &mr,
+                        &surface.foreground,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+            }
+
+            // Deep-link button.
+            let b = layout.button;
+            if hit == Some(QuickHit::Button) {
+                surface.context.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT { rect: b, radiusX: 6.0, radiusY: 6.0 },
+                    &surface.bar_pill_fill,
+                );
+            }
+            let btn: Vec<u16> = button_label.encode_utf16().collect();
+            small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            surface.context.DrawText(
+                &btn,
+                &small,
+                &b,
+                &surface.foreground,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            let action = present(surface);
+            if matches!(action, PresentAction::RecreateAll) {
+                self.device_lost = true;
+            }
+        }
+        Ok(())
+    }
+
     pub fn paint_preview(
         &mut self,
         hwnd: HWND,
