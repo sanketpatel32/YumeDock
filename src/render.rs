@@ -1993,6 +1993,97 @@ pub fn launcher_height(action_count: usize, app_total: usize) -> f32 {
         + LAUNCHER_PAD
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickKind {
+    Volume,
+    Wifi,
+    Battery,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuickLayout {
+    pub width: f32,
+    pub height: f32,
+    /// Mute toggle button rect (volume only).
+    pub mute_button: Option<D2D_RECT_F>,
+    /// Volume slider track rect (volume only). Horizontal.
+    pub slider: Option<D2D_RECT_F>,
+    /// Primary deep-link button rect.
+    pub button: D2D_RECT_F,
+}
+
+pub const QUICK_WIDTH: f32 = 220.0;
+pub const QUICK_HEIGHT: f32 = 110.0;
+const QUICK_PAD: f32 = 14.0;
+const QUICK_BUTTON_H: f32 = 32.0;
+
+pub fn quick_popover_geometry(kind: QuickKind) -> QuickLayout {
+    let width = QUICK_WIDTH;
+    let height = QUICK_HEIGHT;
+    let row_w = width - QUICK_PAD * 2.0;
+    let mut y = QUICK_PAD;
+    let (mute_button, slider) = if matches!(kind, QuickKind::Volume) {
+        let slider = D2D_RECT_F {
+            left: QUICK_PAD,
+            top: y,
+            right: QUICK_PAD + row_w - 40.0,
+            bottom: y + 20.0,
+        };
+        let mute = D2D_RECT_F {
+            left: QUICK_PAD + row_w - 32.0,
+            top: y - 6.0,
+            right: QUICK_PAD + row_w,
+            bottom: y + 26.0,
+        };
+        y += 36.0;
+        (Some(mute), Some(slider))
+    } else {
+        (None, None)
+    };
+    let _ = y;
+    // Button pinned near the bottom.
+    let button_top = height - QUICK_PAD - QUICK_BUTTON_H;
+    let button = D2D_RECT_F {
+        left: QUICK_PAD,
+        top: button_top,
+        right: QUICK_PAD + row_w,
+        bottom: button_top + QUICK_BUTTON_H,
+    };
+    QuickLayout {
+        width,
+        height,
+        mute_button,
+        slider,
+        button,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickHit {
+    MuteButton,
+    Slider,
+    Button,
+    None,
+}
+
+pub fn quick_hit_test(layout: &QuickLayout, x: f32, y: f32) -> QuickHit {
+    if let Some(r) = layout.mute_button
+        && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+    {
+        return QuickHit::MuteButton;
+    }
+    if let Some(r) = layout.slider
+        && x >= r.left && x <= r.right && y >= r.top - 6.0 && y <= r.bottom + 6.0
+    {
+        return QuickHit::Slider;
+    }
+    let r = layout.button;
+    if x >= r.left && x <= r.right && y >= r.top && y <= r.bottom {
+        return QuickHit::Button;
+    }
+    QuickHit::None
+}
+
 pub fn dock_hit_test(
     x: f32,
     width: f32,
@@ -2629,9 +2720,10 @@ fn bolt_figure() -> LocalFigure {
 #[cfg(test)]
 mod tests {
     use super::{
-        LAUNCHER_MAX_VISIBLE_ROWS, LauncherHit, LauncherLayout, dock_geometry,
-        launcher_geometry, launcher_height, launcher_hit_test, smoothstep, top_bar_geometry,
-        top_bar_hit_test, RectExt, TopBarSegment, TopBarSegmentFlags, TopBarStatus,
+        LAUNCHER_MAX_VISIBLE_ROWS, LauncherHit, LauncherLayout, QUICK_WIDTH, QuickHit, QuickKind,
+        QuickLayout, dock_geometry, launcher_geometry, launcher_height, launcher_hit_test,
+        quick_hit_test, quick_popover_geometry, smoothstep, top_bar_geometry, top_bar_hit_test,
+        RectExt, TopBarSegment, TopBarSegmentFlags, TopBarStatus,
     };
 
     fn full_status() -> TopBarStatus {
@@ -2792,5 +2884,30 @@ mod tests {
         assert!((h_full - h_capped).abs() < 0.001);
         // 5 apps is shorter.
         assert!(launcher_height(3, 5) < h_capped);
+    }
+
+    #[test]
+    fn quick_volume_layout_has_slider_and_mute() {
+        let layout = quick_popover_geometry(QuickKind::Volume);
+        assert!(layout.slider.is_some());
+        assert!(layout.mute_button.is_some());
+        let s = layout.slider.unwrap();
+        let m = layout.mute_button.unwrap();
+        // Slider is to the left of the mute button.
+        assert!(s.right <= m.left);
+    }
+
+    #[test]
+    fn quick_wifi_layout_has_no_slider() {
+        let layout = quick_popover_geometry(QuickKind::Wifi);
+        assert!(layout.slider.is_none());
+        assert!(layout.mute_button.is_none());
+    }
+
+    #[test]
+    fn quick_hit_test_finds_button() {
+        let layout = quick_popover_geometry(QuickKind::Battery);
+        let cy = (layout.button.top + layout.button.bottom) / 2.0;
+        assert_eq!(quick_hit_test(&layout, QUICK_WIDTH / 2.0, cy), QuickHit::Button);
     }
 }

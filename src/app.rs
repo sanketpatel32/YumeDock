@@ -4,8 +4,8 @@ use crate::{
     config::{ConfigV1, PinConfig, PinKind},
     model::{DockItem, MonitorInfo, WindowEntry, enumerate_monitors, group_for_monitor},
     render::{
-        DockBounce, DockHover, DockRenderState, DockVisual, LauncherHit, Renderer, TopBarSegment,
-        TopBarSegmentFlags, TopBarStatus,
+        DockBounce, DockHover, DockRenderState, DockVisual, LauncherHit, QuickKind, Renderer,
+        TopBarSegment, TopBarSegmentFlags, TopBarStatus,
     },
     shell::{AppBar, TaskbarState},
     status, tracker,
@@ -147,6 +147,7 @@ enum WindowKind {
     LaunchOverlay,
     DebugPopover,
     Launcher,
+    QuickPopover,
 }
 
 struct Preview {
@@ -180,6 +181,15 @@ struct LauncherState {
     scroll: usize,
     /// Currently hovered target.
     hover: Option<LauncherHit>,
+}
+
+/// State for the open Wi-Fi/volume/battery quick popover. No hwnd/owner here
+/// — those live on `active_popover`/`Popover`. The handlers receive hwnd from
+/// window_proc.
+struct QuickPopoverState {
+    kind: crate::render::QuickKind,
+    /// True while the user is dragging the volume slider.
+    dragging: bool,
 }
 
 /// A single topbar popover window. Only one is ever open at a time
@@ -277,6 +287,7 @@ pub struct App {
     last_clock: String,
     active_popover: Option<Popover>,
     launcher: Option<LauncherState>,
+    quick_popover: Option<QuickPopoverState>,
 }
 
 impl App {
@@ -330,6 +341,7 @@ impl App {
             last_clock,
             active_popover: None,
             launcher: None,
+            quick_popover: None,
         };
         if app.config.behavior.replace_taskbar {
             app.taskbar.hide();
@@ -2274,9 +2286,15 @@ impl App {
                 match segment {
                     Some(TopBarSegment::Logo) => self.open_launcher(hwnd),
                     Some(TopBarSegment::App) => self.show_top_menu(hwnd),
-                    Some(
-                        TopBarSegment::Network | TopBarSegment::Volume | TopBarSegment::Battery,
-                    ) => self.handle_command(CMD_QUICK_SETTINGS),
+                    Some(TopBarSegment::Network) => {
+                        self.open_quick_popover(hwnd, QuickKind::Wifi)
+                    }
+                    Some(TopBarSegment::Volume) => {
+                        self.open_quick_popover(hwnd, QuickKind::Volume)
+                    }
+                    Some(TopBarSegment::Battery) => {
+                        self.open_quick_popover(hwnd, QuickKind::Battery)
+                    }
                     Some(TopBarSegment::Clock) => self.handle_command(CMD_NOTIFICATION_CENTER),
                     _ => self.show_top_menu(hwnd),
                 }
@@ -2901,6 +2919,7 @@ impl App {
     fn close_popover(&mut self) {
         if let Some(popover) = self.active_popover.take() {
             self.launcher = None;
+            self.quick_popover = None;
             self.kinds.remove(&(popover.hwnd.0 as isize));
             self.renderer.forget(popover.hwnd);
             unsafe {
@@ -3081,6 +3100,18 @@ impl App {
                 scroll: 0,
                 hover: None,
             });
+            unsafe {
+                let _ = InvalidateRect(Some(popover.hwnd), None, false);
+            }
+        }
+    }
+
+    fn open_quick_popover(&mut self, owner: HWND, kind: crate::render::QuickKind) {
+        let w = crate::render::QUICK_WIDTH as i32;
+        let h = crate::render::QUICK_HEIGHT as i32;
+        self.open_popover(owner, WindowKind::QuickPopover, w, h);
+        if let Some(popover) = self.active_popover.as_ref() {
+            self.quick_popover = Some(QuickPopoverState { kind, dragging: false });
             unsafe {
                 let _ = InvalidateRect(Some(popover.hwnd), None, false);
             }
